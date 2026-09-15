@@ -24,6 +24,14 @@ desktop web app on large screens.
 
 ---
 
+## Screenshots
+
+| Chat (cold start, standalone) | Session drawer + scrim |
+|---|---|
+| ![Phone chat view](assets/phone-chat.png) | ![Session drawer with scrim](assets/phone-drawer.png) |
+
+*Real iPhone viewport (390×844, `--safe-top:59px` / `--safe-bottom:34px` injected). The session list is blurred — those are real session names.*
+
 ## What you get
 
 | | |

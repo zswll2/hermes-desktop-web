@@ -14,6 +14,14 @@
 
 ---
 
+## 截图
+
+| 聊天页（冷启动 / 主屏 standalone） | 会话抽屉 + 遮罩 |
+|---|---|
+| ![手机聊天页](assets/phone-chat.png) | ![会话抽屉与遮罩](assets/phone-drawer.png) |
+
+*真实 iPhone 视口（390×844，注入 `--safe-top:59px` / `--safe-bottom:34px`）。会话列表已打码——那是真实会话名。*
+
 ## 一、能获得什么
 
 | 能力 | 说明 |
