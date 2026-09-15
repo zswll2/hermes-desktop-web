@@ -1,0 +1,136 @@
+From 0b24cc5a73764dc81795b88e48b51461ca459548 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 10:47:45 +0800
+Subject: [PATCH 22/32] fix(desktop): web-bridge expected-missing channels log
+ at debug, not warn
+
+---
+ .../desktop/src/lib/bridge/web-bridge.test.ts | 26 +++++++++++++-
+ apps/desktop/src/lib/bridge/web-bridge.ts     | 34 +++++++++++++------
+ 2 files changed, 48 insertions(+), 12 deletions(-)
+
+diff --git a/apps/desktop/src/lib/bridge/web-bridge.test.ts b/apps/desktop/src/lib/bridge/web-bridge.test.ts
+index 80293b8e43..9c0075fa84 100644
+--- a/apps/desktop/src/lib/bridge/web-bridge.test.ts
++++ b/apps/desktop/src/lib/bridge/web-bridge.test.ts
+@@ -1,6 +1,6 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+-import { createWebBridge, WebApiAuthError, WebApiError, WebBridgeCapabilityError } from './web-bridge'
++import { createWebBridge, degradationLogLevel, WebApiAuthError, WebApiError, WebBridgeCapabilityError } from './web-bridge'
+ import { isWebVirtualPath, registerWebFile, resetWebFileRegistry, WEB_FS_ROOT } from './web-file-registry'
+ 
+ import { getBridge } from './index'
+@@ -293,6 +293,30 @@ describe('web-bridge degraded members', () => {
+     const bridge = createWebBridge()
+     await expect(bridge.openExternal('file:///etc/passwd')).rejects.toBeInstanceOf(WebBridgeCapabilityError)
+   })
++
++  it('expected-missing channels log at debug, not warn, and only once (web build)', async () => {
++    // getPoolLimits is untouched by the other tests, so the module-level
++    // once-set is guaranteed empty for it regardless of test order.
++    const debug = vi.spyOn(console, 'debug').mockImplementation(() => {})
++    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
++    const bridge = createWebBridge()
++
++    await expect(bridge.getPoolLimits()).rejects.toBeInstanceOf(WebBridgeCapabilityError)
++    await expect(bridge.getPoolLimits()).rejects.toBeInstanceOf(WebBridgeCapabilityError)
++
++    // vitest defines __HERMES_WEB__ = true, matching the real web build.
++    expect(debug).toHaveBeenCalledTimes(1)
++    expect(debug).toHaveBeenCalledWith('[web-bridge] unavailable:', 'getPoolLimits')
++    expect(warn).not.toHaveBeenCalled()
++
++    debug.mockRestore()
++    warn.mockRestore()
++  })
++
++  it('degradationLogLevel: web builds debug, hosts that should be complete warn', () => {
++    expect(degradationLogLevel(true)).toBe('debug')
++    expect(degradationLogLevel(false)).toBe('warn')
++  })
+ })
+ 
+ describe('bridge install contract', () => {
+diff --git a/apps/desktop/src/lib/bridge/web-bridge.ts b/apps/desktop/src/lib/bridge/web-bridge.ts
+index 480ff3680d..f640f5966e 100644
+--- a/apps/desktop/src/lib/bridge/web-bridge.ts
++++ b/apps/desktop/src/lib/bridge/web-bridge.ts
+@@ -55,22 +55,34 @@ const SESSION_HEADER = 'X-Hermes-Session-Token'
+ 
+ const warned = new Set<string>()
+ 
+-function warnOnce(capability: string): void {
++/** Where the once-per-capability degradation notice goes: web builds EXPECT
++ *  every `unavailable()` channel to be missing (no Electron main behind the
++ *  page), so a dozen startup `warn`s there drowned real console noise during
++ *  mobile acceptance — `debug` keeps it retrievable without the noise. Hosts
++ *  where the bridge SHOULD be complete (tests simulating Electron, future
++ *  embedders) keep the `warn`. Pure so both sides are unit-testable. */
++export function degradationLogLevel(webBuild: boolean): 'debug' | 'warn' {
++  return webBuild ? 'debug' : 'warn'
++}
++
++function logOnce(capability: string): void {
+   if (warned.has(capability)) {return}
+   warned.add(capability)
+-   
+-  console.warn('[web-bridge] unavailable:', capability)
++
++  console[degradationLogLevel(__HERMES_WEB__)]('[web-bridge] unavailable:', capability)
+ }
+ 
+ /**
+  * Structured degradation for a required bridge member the browser cannot
+- * offer. Rejects with `WebBridgeCapabilityError` on first use (and warns once
+- * per capability) so misrouted calls are visible in the console during
+- * acceptance instead of failing as silent `undefined`.
++ * offer. Rejects with `WebBridgeCapabilityError` on first use and logs once
++ * per capability at the level `degradationLogLevel` picks — `debug` in web
++ * builds (expected-missing channels must not bury real warnings), `warn`
++ * where the member should exist. Rejection semantics are identical either
++ * way; only visibility changes.
+  */
+ function unavailable(capability: string): (...args: unknown[]) => Promise<never> {
+   return (...args: unknown[]) => {
+-    warnOnce(capability)
++    logOnce(capability)
+ 
+     return Promise.reject(new WebBridgeCapabilityError(capability))
+   }
+@@ -259,7 +271,7 @@ function sharedPickerInput(accept: string, multiple: boolean): HTMLInputElement
+ 
+ async function webSelectPaths(options?: HermesSelectPathsOptions): Promise<string[]> {
+   if (options?.directories) {
+-    warnOnce('selectPaths.directories')
++    logOnce('selectPaths.directories')
+ 
+     return Promise.reject(new WebBridgeCapabilityError('selectPaths.directories'))
+   }
+@@ -299,7 +311,7 @@ async function webSaveImageBuffer(
+ 
+ async function webReadClipboard(): Promise<string> {
+   if (!navigator.clipboard) {
+-    warnOnce('readClipboard')
++    logOnce('readClipboard')
+ 
+     return Promise.reject(new WebBridgeCapabilityError('readClipboard'))
+   }
+@@ -309,7 +321,7 @@ async function webReadClipboard(): Promise<string> {
+ 
+ async function webWriteClipboard(text: string): Promise<boolean> {
+   if (!navigator.clipboard) {
+-    warnOnce('writeClipboard')
++    logOnce('writeClipboard')
+ 
+     return Promise.reject(new WebBridgeCapabilityError('writeClipboard'))
+   }
+@@ -321,7 +333,7 @@ async function webWriteClipboard(text: string): Promise<boolean> {
+ 
+ async function webOpenExternal(url: string): Promise<void> {
+   if (!/^https?:\/\//i.test(url)) {
+-    warnOnce('openExternal')
++    logOnce('openExternal')
+ 
+     return Promise.reject(new WebBridgeCapabilityError(`openExternal(${url})`))
+   }

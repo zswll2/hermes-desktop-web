@@ -1,0 +1,38 @@
+From ed1c797f8513074dcd8f3cf3fabbc98812e935a5 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 10:15:48 +0800
+Subject: [PATCH 19/32] fix(desktop): near-full-width overlay card on phones
+ (safe-top out of horizontal inset)
+
+---
+ apps/desktop/src/app/overlays/overlay-view.tsx | 17 ++++++++---------
+ 1 file changed, 8 insertions(+), 9 deletions(-)
+
+diff --git a/apps/desktop/src/app/overlays/overlay-view.tsx b/apps/desktop/src/app/overlays/overlay-view.tsx
+index ce90071a51..72b34d97b9 100644
+--- a/apps/desktop/src/app/overlays/overlay-view.tsx
++++ b/apps/desktop/src/app/overlays/overlay-view.tsx
+@@ -75,15 +75,14 @@ export function OverlayView({
+     <div
+       className={cn(
+         'fixed inset-0 z-50 bg-black/22 backdrop-blur-[0.125rem]',
+-        // Equidistant inset on every side. The top value is driven by the
+-        // titlebar height so the card clears the OS traffic-lights vertically;
+-        // since the card top already sits below them, the left needs no extra
+-        // inset — keeping all sides equal so the card is ~full-width at any
+-        // size. The safe-area inset joins the top calc only (fixed surface,
+-        // no ancestor padding); the drag-band semantics of
+-        // --titlebar-height itself are unchanged.
+-        'p-[calc(var(--titlebar-height)+var(--safe-top,0px)+0.625rem)]',
+-        'sm:p-[calc(var(--titlebar-height)+var(--safe-top,0px)+0.875rem)]'
++        // --safe-top is a top-only inset: it must never widen the horizontal
++        // padding (a 59px notch on both sides crushed the card to 47vw on
++        // phones). Below sm the card is near-full-width (side inset 0.625rem,
++        // bottom adds --safe-bottom for the home indicator); from sm up the
++        // desktop keeps the equidistant floating-card inset — titlebar +
++        // gutter per side, where the safe-area vars are 0 anyway.
++        'px-2.5 pb-[calc(0.625rem+var(--safe-bottom,0px))] pt-[calc(var(--titlebar-height)+var(--safe-top,0px)+0.625rem)]',
++        'sm:px-[calc(var(--titlebar-height)+0.875rem)] sm:pb-[calc(var(--titlebar-height)+0.875rem)] sm:pt-[calc(var(--titlebar-height)+var(--safe-top,0px)+0.875rem)]'
+       )}
+       // Every OverlayView-based overlay (settings, command-center, agents, cron,
+       // profiles, star map, …) covers the chat while the composer stays mounted

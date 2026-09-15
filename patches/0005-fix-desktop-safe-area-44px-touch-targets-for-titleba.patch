@@ -1,0 +1,78 @@
+From cfbd04d172e64cef6438c47d5764888e5c6cd304 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 11:48:47 +0800
+Subject: [PATCH 05/32] fix(desktop): safe-area + 44px touch targets for
+ titlebar chrome
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The fixed titlebar tool clusters (left/pane/system) render under the iOS
+status bar in the web build (black-translucent), leaving the hide-sidebar
+button inside the 44px system gesture band — visible but untappable.
+
+- data-slot='titlebar-chrome' on all three clusters (the testable anchor)
+- padding-top: var(--safe-top) yields to the status bar; collapses to 0 on
+  desktop where env() reports no inset
+- (pointer: coarse) grows the buttons' hit area to 44px min; glyph size and
+  the mouse-driven 24px desktop rhythm are unchanged
+---
+ .../src/app/shell/titlebar-controls.tsx       |  3 +++
+ apps/desktop/src/styles.css                   | 19 +++++++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/apps/desktop/src/app/shell/titlebar-controls.tsx b/apps/desktop/src/app/shell/titlebar-controls.tsx
+index 632e7a9bf0..d5a19c42ac 100644
+--- a/apps/desktop/src/app/shell/titlebar-controls.tsx
++++ b/apps/desktop/src/app/shell/titlebar-controls.tsx
+@@ -276,6 +276,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
+           titlebarToolClusterClass,
+           'left-(--titlebar-controls-left) top-(--titlebar-controls-top) translate-y-(--titlebar-controls-y-nudge)'
+         )}
++        data-slot="titlebar-chrome"
+       >
+         {leftToolbarTools
+           .filter(tool => !tool.hidden)
+@@ -299,6 +300,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
+             titlebarToolClusterClass,
+             'top-[calc(var(--titlebar-controls-top)+var(--right-rail-top-inset,0px))] right-[calc(var(--titlebar-tools-right)+var(--shell-preview-toolbar-gap,0))]'
+           )}
++          data-slot="titlebar-chrome"
+         >
+           {visiblePaneTools.map(tool => (
+             <TitlebarToolButton key={tool.id} navigate={navigate} tool={tool} />
+@@ -309,6 +311,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
+       <div
+         aria-label={t.shell.appControls}
+         className={cn(titlebarToolClusterClass, 'right-(--titlebar-tools-right) top-(--titlebar-controls-top)')}
++        data-slot="titlebar-chrome"
+       >
+         {visibleSystemTools.map(tool => (
+           <TitlebarToolButton key={tool.id} navigate={navigate} tool={tool} />
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index 58e32c5226..c8faae7386 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3593,3 +3593,22 @@ button,
+     transform: translateX(4%);
+   }
+ }
++
++/* Fixed titlebar tool clusters (left tools / pane tools / system tools) yield
++   to the iOS status bar: `black-translucent` draws the page under it, so the
++   cluster's children are pushed down by the safe-area inset. padding keeps the
++   fixed element's own top offset (per-cluster `top` vars) intact and collapses
++   to 0 on desktops, where env() reports no inset. */
++[data-slot='titlebar-chrome'] {
++  padding-top: var(--safe-top);
++}
++
++/* Touch devices: titlebar icon buttons meet the 44px minimum touch target.
++   The glyph stays at its designed size — only the hit area grows. Coarse
++   pointers only, so mouse-driven titlebars keep their tight 24px rhythm. */
++@media (pointer: coarse) {
++  [data-slot='titlebar-chrome'] [data-slot='tooltip-trigger'] {
++    min-height: 44px;
++    min-width: 44px;
++  }
++}

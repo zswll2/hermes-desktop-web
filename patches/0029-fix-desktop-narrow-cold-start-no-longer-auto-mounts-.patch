@@ -1,0 +1,203 @@
+From a8e3ecf61df2445b81766ee765a44d8485950221 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 20:07:35 +0800
+Subject: [PATCH 29/32] fix(desktop): narrow cold start no longer auto-mounts a
+ terminal shell
+
+---
+ apps/desktop/src/app/right-sidebar/store.ts   | 13 +++-
+ .../terminal/persistent.test.tsx              | 11 +++-
+ .../app/right-sidebar/terminal/persistent.tsx | 14 +++--
+ .../terminal/should-auto-mount.test.ts        | 62 +++++++++++++++++++
+ .../terminal/should-auto-mount.ts             | 20 ++++++
+ 5 files changed, 112 insertions(+), 8 deletions(-)
+ create mode 100644 apps/desktop/src/app/right-sidebar/terminal/should-auto-mount.test.ts
+ create mode 100644 apps/desktop/src/app/right-sidebar/terminal/should-auto-mount.ts
+
+diff --git a/apps/desktop/src/app/right-sidebar/store.ts b/apps/desktop/src/app/right-sidebar/store.ts
+index b0e26f0388..8087763738 100644
+--- a/apps/desktop/src/app/right-sidebar/store.ts
++++ b/apps/desktop/src/app/right-sidebar/store.ts
+@@ -8,7 +8,18 @@ export const $terminalTakeover = atom(storedBoolean(TAKEOVER_KEY, false))
+ 
+ $terminalTakeover.subscribe(active => persistBoolean(TAKEOVER_KEY, active))
+ 
+-export const setTerminalTakeover = (active: boolean) => $terminalTakeover.set(active)
++/** Session-only latch: the user explicitly opened the terminal pane THIS
++ *  session. Never persisted — a cold-start restore of takeover=true is not
++ *  explicit intent (see shouldAutoMountTerminal). Closing does not unlatch. */
++export const $terminalTakeoverIntent = atom(false)
++
++export const setTerminalTakeover = (active: boolean) => {
++  if (active) {
++    $terminalTakeoverIntent.set(true)
++  }
++
++  $terminalTakeover.set(active)
++}
+ 
+ /** A command queued to run in the embedded terminal. The terminal pane flushes
+  *  (and clears) it once its session is live, so a value set before the pane
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/persistent.test.tsx b/apps/desktop/src/app/right-sidebar/terminal/persistent.test.tsx
+index ab4155823b..225b9fddd3 100644
+--- a/apps/desktop/src/app/right-sidebar/terminal/persistent.test.tsx
++++ b/apps/desktop/src/app/right-sidebar/terminal/persistent.test.tsx
+@@ -10,9 +10,14 @@ import { $terminalTakeover } from '../store'
+ 
+ import { PersistentTerminal, TerminalSlot } from './persistent'
+ 
+-vi.mock('../store', async () => ({
+-  $terminalTakeover: (await import('nanostores')).atom(false)
+-}))
++vi.mock('../store', async () => {
++  const { atom } = await import('nanostores')
++
++  return {
++    $terminalTakeover: atom(false),
++    $terminalTakeoverIntent: atom(false)
++  }
++})
+ 
+ vi.mock('./terminals', () => ({
+   ensureTerminal: vi.fn()
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/persistent.tsx b/apps/desktop/src/app/right-sidebar/terminal/persistent.tsx
+index f40fcedf6c..7376800db2 100644
+--- a/apps/desktop/src/app/right-sidebar/terminal/persistent.tsx
++++ b/apps/desktop/src/app/right-sidebar/terminal/persistent.tsx
+@@ -3,13 +3,14 @@ import { atom } from 'nanostores'
+ import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from 'react'
+ 
+ import { isElementInHiddenPane, PANE_HIDDEN_ATTR } from '@/components/pane-shell/pane-visibility'
+-import { $layoutTree } from '@/components/pane-shell/tree/store'
++import { $layoutTree, $narrowViewport } from '@/components/pane-shell/tree/store'
+ import { markRightPanePerf } from '@/debug/right-pane-events'
+ import { createRendererLoopPauseController } from '@/lib/renderer-loop-pause'
+ import { $paneStates } from '@/store/panes'
+ 
+-import { $terminalTakeover } from '../store'
++import { $terminalTakeover, $terminalTakeoverIntent } from '../store'
+ 
++import { shouldAutoMountTerminal } from './should-auto-mount'
+ import { ensureTerminal } from './terminals'
+ import { TerminalWorkspace } from './workspace'
+ 
+@@ -64,6 +65,8 @@ const sameRect = (a: Rect | null, b: Rect) =>
+ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalProps) {
+   const slot = useStore($slot)
+   const terminalTakeover = useStore($terminalTakeover)
++  const narrowViewport = useStore($narrowViewport)
++  const takeoverIntent = useStore($terminalTakeoverIntent)
+   const [rect, setRect] = useState<Rect | null>(null)
+   const [ready, setReady] = useState(false)
+ 
+@@ -75,11 +78,14 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
+   const [mounted, setMounted] = useState(false)
+ 
+   useEffect(() => {
+-    if (terminalTakeover && ready) {
++    if (
++      shouldAutoMountTerminal({ takeover: terminalTakeover, narrow: narrowViewport, sessionIntent: takeoverIntent }) &&
++      ready
++    ) {
+       setMounted(true)
+       ensureTerminal()
+     }
+-  }, [terminalTakeover, ready])
++  }, [terminalTakeover, narrowViewport, takeoverIntent, ready])
+ 
+   useLayoutEffect(() => {
+     if (!slot) {
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/should-auto-mount.test.ts b/apps/desktop/src/app/right-sidebar/terminal/should-auto-mount.test.ts
+new file mode 100644
+index 0000000000..adf0e488e5
+--- /dev/null
++++ b/apps/desktop/src/app/right-sidebar/terminal/should-auto-mount.test.ts
+@@ -0,0 +1,62 @@
++import { beforeEach, describe, expect, it } from 'vitest'
++
++import { $terminalTakeover, $terminalTakeoverIntent, setTerminalTakeover } from '../store'
++
++import { shouldAutoMountTerminal } from './should-auto-mount'
++
++const combos: Array<{ narrow: boolean; sessionIntent: boolean; takeover: boolean } & { expected: boolean }> = [
++  // Narrow cold start: takeover restored from storage, no explicit open yet —
++  // the phone-first-open bug. No shell.
++  { takeover: true, narrow: true, sessionIntent: false, expected: false },
++  // Narrow + the user opened the pane this session (⌃`, statusbar, palette,
++  // injection, agent link) — mount.
++  { takeover: true, narrow: true, sessionIntent: true, expected: true },
++  // Wide: VS Code parity — a persisted open pane auto-restores its shell.
++  { takeover: true, narrow: false, sessionIntent: false, expected: true },
++  { takeover: true, narrow: false, sessionIntent: true, expected: true }
++]
++
++describe('shouldAutoMountTerminal', () => {
++  it.each(combos)(
++    'takeover=$takeover narrow=$narrow intent=$sessionIntent -> $expected',
++    ({ expected, narrow, sessionIntent, takeover }) => {
++      expect(shouldAutoMountTerminal({ narrow, sessionIntent, takeover })).toBe(expected)
++    }
++  )
++
++  it('never auto-mounts with takeover=false, whatever the viewport or latch', () => {
++    expect(shouldAutoMountTerminal({ narrow: true, sessionIntent: true, takeover: false })).toBe(false)
++    expect(shouldAutoMountTerminal({ narrow: false, sessionIntent: true, takeover: false })).toBe(false)
++  })
++})
++
++describe('setTerminalTakeover intent latch', () => {
++  beforeEach(() => {
++    window.localStorage.clear()
++    $terminalTakeover.set(false)
++    $terminalTakeoverIntent.set(false)
++  })
++
++  it('an explicit open latches session intent; the persisted flag alone never does', () => {
++    setTerminalTakeover(true)
++
++    expect($terminalTakeover.get()).toBe(true)
++    expect($terminalTakeoverIntent.get()).toBe(true)
++  })
++
++  it('closing does not unlatch — keep-alive semantics survive a collapse', () => {
++    setTerminalTakeover(true)
++    setTerminalTakeover(false)
++
++    expect($terminalTakeover.get()).toBe(false)
++    expect($terminalTakeoverIntent.get()).toBe(true)
++  })
++
++  it('a latched explicit open makes the narrow gate pass (the ⌃`-on-a-phone path)', () => {
++    setTerminalTakeover(true)
++
++    expect(
++      shouldAutoMountTerminal({ narrow: true, sessionIntent: $terminalTakeoverIntent.get(), takeover: true })
++    ).toBe(true)
++  })
++})
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/should-auto-mount.ts b/apps/desktop/src/app/right-sidebar/terminal/should-auto-mount.ts
+new file mode 100644
+index 0000000000..98ea30245c
+--- /dev/null
++++ b/apps/desktop/src/app/right-sidebar/terminal/should-auto-mount.ts
+@@ -0,0 +1,20 @@
++/** Auto-mount gate for the persistent terminal host.
++ *
++ *  `takeover` is persisted, so it is already true on a cold start whenever the
++ *  pane was open when the app last closed — including on a phone, where
++ *  auto-spawning that shell takes over the first screen. `sessionIntent`
++ *  (from setTerminalTakeover) separates "was open" from "the user opened it",
++ *  so a narrow cold start stays shell-free while every explicit open still
++ *  mounts. Wide viewports are unchanged: restoring an open pane there is the
++ *  VS Code behaviour users expect. */
++export function shouldAutoMountTerminal({
++  narrow,
++  sessionIntent,
++  takeover
++}: {
++  narrow: boolean
++  sessionIntent: boolean
++  takeover: boolean
++}): boolean {
++  return takeover && (!narrow || sessionIntent)
++}

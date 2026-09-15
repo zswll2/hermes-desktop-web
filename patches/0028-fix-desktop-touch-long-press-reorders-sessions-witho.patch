@@ -1,0 +1,271 @@
+From 2d969dff1d677919b9641dc6dffdb36215768283 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 23:43:48 +0800
+Subject: [PATCH 28/32] fix(desktop): touch long-press reorders sessions
+ without stealing scrolls
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The sessions list shared one PointerSensor (6px activation) across mouse and
+touch, and the reorder listeners sit on the whole row: on a phone a 6px drag
+arm wrestled the vertical scroll away. Touch now gets its own lane —
+sidebarReorderSensors() picks TouchSensor with a 400ms/5px long-press
+constraint on coarse pointers (swipes stay native scrolls; pan-y on the
+rows keeps the browser owning vertical pans) and keeps the unchanged
+PointerSensor + KeyboardSensor pair on fine pointers. Reorderable rows also
+suppress the iOS long-press callout loupe, and a touch-activated drag
+confirms itself with a tap haptic through the existing gesture gate.
+
+The pan-y/callout rule lives unlayered in styles.css: Tailwind utilities
+are @layer'd and lose to the unlayered 'button { touch-action: manipulation }'
+rule they must override.
+---
+ apps/desktop/src/app/chat/sidebar/index.tsx   | 11 ++-
+ .../app/chat/sidebar/reorder-sensors.test.tsx | 69 +++++++++++++++++++
+ .../src/app/chat/sidebar/reorder-sensors.ts   | 39 +++++++++++
+ .../src/app/chat/sidebar/reorderable-list.tsx | 15 +++-
+ .../src/app/chat/sidebar/session-row.tsx      |  3 +
+ apps/desktop/src/styles.css                   | 12 ++++
+ 6 files changed, 142 insertions(+), 7 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/sidebar/reorder-sensors.test.tsx
+ create mode 100644 apps/desktop/src/app/chat/sidebar/reorder-sensors.ts
+
+diff --git a/apps/desktop/src/app/chat/sidebar/index.tsx b/apps/desktop/src/app/chat/sidebar/index.tsx
+index 611a5a4d45..cbc4a0d412 100644
+--- a/apps/desktop/src/app/chat/sidebar/index.tsx
++++ b/apps/desktop/src/app/chat/sidebar/index.tsx
+@@ -1,5 +1,3 @@
+-import { KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core'
+-import { sortableKeyboardCoordinates } from '@dnd-kit/sortable'
+ import { useStore } from '@nanostores/react'
+ import type * as React from 'react'
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+@@ -24,6 +22,7 @@ import {
+ import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
+ import { useContributions } from '@/contrib/react/use-contributions'
+ import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
++import { useMediaQuery } from '@/hooks/use-media-query'
+ import { useI18n } from '@/i18n'
+ import { comboTokens } from '@/lib/keybinds/combo'
+ import { resolveProfileColor } from '@/lib/profile-color'
+@@ -175,6 +174,7 @@ import {
+   useRepoWorktreeMap
+ } from './projects'
+ import { WorktreeDialog } from './projects/worktree-dialog'
++import { sidebarReorderSensors } from './reorder-sensors'
+ import {
+   SidebarBlankState,
+   SidebarLoadErrorState,
+@@ -506,10 +506,9 @@ export function ChatSidebar({
+ 
+   const activeSidebarSessionId = currentView === 'chat' ? selectedSessionId : null
+ 
+-  const dndSensors = useSensors(
+-    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+-  )
++  // Why per-pointer sensors: reorder-sensors.ts (touch long-press vs scroll).
++  const coarsePointer = useMediaQuery('(pointer: coarse)')
++  const dndSensors = useMemo(() => sidebarReorderSensors(coarsePointer ? 'coarse' : 'fine'), [coarsePointer])
+ 
+   // Profile scope = the "workspace switcher" context. Concrete scope shows only
+   // that profile's sessions (clean rows, no per-row tags); ALL fans every
+diff --git a/apps/desktop/src/app/chat/sidebar/reorder-sensors.test.tsx b/apps/desktop/src/app/chat/sidebar/reorder-sensors.test.tsx
+new file mode 100644
+index 0000000000..15a61af05d
+--- /dev/null
++++ b/apps/desktop/src/app/chat/sidebar/reorder-sensors.test.tsx
+@@ -0,0 +1,69 @@
++import { KeyboardSensor, PointerSensor, TouchSensor } from '@dnd-kit/core'
++import { sortableKeyboardCoordinates } from '@dnd-kit/sortable'
++import { render } from '@testing-library/react'
++import { describe, expect, it, vi } from 'vitest'
++
++import { sidebarReorderSensors } from './reorder-sensors'
++import { ReorderableList } from './reorderable-list'
++
++// Capture the props ReorderableList forwards into DndContext so the "DndContext
++// actually receives these sensors" half of the contract is asserted against the
++// real component, not a re-implementation.
++const dndPropsHistory = vi.hoisted(() => [] as { sensors?: unknown[] }[])
++
++vi.mock('@dnd-kit/core', async importOriginal => {
++  const actual = await importOriginal<Record<string, unknown>>()
++
++  return {
++    ...actual,
++    DndContext: (props: { sensors?: unknown[] }) => {
++      dndPropsHistory.push(props)
++
++      return null
++    }
++  }
++})
++
++describe('sidebarReorderSensors', () => {
++  it('coarse: exactly one TouchSensor with the 400ms/5px long-press constraint', () => {
++    const sensors = sidebarReorderSensors('coarse')
++
++    expect(sensors).toHaveLength(1)
++    expect(sensors[0].sensor).toBe(TouchSensor)
++    expect(sensors[0].options).toEqual({ activationConstraint: { delay: 400, tolerance: 5 } })
++  })
++
++  it('coarse: no PointerSensor — quick swipes must never arm a drag', () => {
++    const sensors = sidebarReorderSensors('coarse')
++
++    expect(sensors.map(s => s.sensor)).not.toContain(PointerSensor)
++  })
++
++  it('fine: PointerSensor at distance 6 plus the KeyboardSensor pair, unchanged', () => {
++    const sensors = sidebarReorderSensors('fine')
++
++    expect(sensors).toHaveLength(2)
++    expect(sensors[0].sensor).toBe(PointerSensor)
++    expect(sensors[0].options).toEqual({ activationConstraint: { distance: 6 } })
++    expect(sensors[1].sensor).toBe(KeyboardSensor)
++    expect(sensors[1].options).toEqual({ coordinateGetter: sortableKeyboardCoordinates })
++  })
++})
++
++describe('ReorderableList wiring', () => {
++  it('hands the exact sensor descriptors to DndContext (coarse and fine)', () => {
++    for (const kind of ['coarse', 'fine'] as const) {
++      const sensors = sidebarReorderSensors(kind)
++
++      render(
++        <ReorderableList ids={['a', 'b']} onReorder={() => undefined} sensors={sensors}>
++          <div />
++        </ReorderableList>
++      )
++
++      const forwarded = dndPropsHistory.at(-1)?.sensors
++
++      expect(forwarded).toBe(sensors)
++    }
++  })
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/reorder-sensors.ts b/apps/desktop/src/app/chat/sidebar/reorder-sensors.ts
+new file mode 100644
+index 0000000000..6ceacaa347
+--- /dev/null
++++ b/apps/desktop/src/app/chat/sidebar/reorder-sensors.ts
+@@ -0,0 +1,39 @@
++import { KeyboardSensor, PointerSensor, type SensorDescriptor, TouchSensor } from '@dnd-kit/core'
++import { sortableKeyboardCoordinates } from '@dnd-kit/sortable'
++
++export type SidebarPointerKind = 'coarse' | 'fine'
++
++/**
++ * Touch reorder activation: hold ~400ms (tolerating a 5px drift) before the
++ * drag claims the gesture. Anything shorter stays a scroll — `touch-action:
++ * pan-y` on the session rows lets the browser take vertical pans immediately
++ * (which pointercancels a PointerSensor mid-activation), so touch reordering
++ * MUST ride the native-touch TouchSensor to work at all.
++ */
++const TOUCH_REORDER_CONSTRAINT = { delay: 400, tolerance: 5 }
++
++/**
++ * Pointer reorder activation: 6px of travel separates a click-to-open from a
++ * drag-to-reorder. Unchanged from the sensor setup this module replaced.
++ */
++const POINTER_REORDER_CONSTRAINT = { distance: 6 }
++
++/**
++ * Sensors for the sidebar's reorder lists, picked by pointer kind:
++ * coarse → TouchSensor (long-press activates; scrolls stay native),
++ * fine   → PointerSensor + KeyboardSensor (mouse/trackpad + keyboard a11y).
++ *
++ * Returns plain SensorDescriptors: DndContext accepts them directly
++ * (it runs the same setup useSensor would), so this stays a pure function
++ * instead of a hook — call sites memoize on the pointer kind.
++ */
++export function sidebarReorderSensors(pointerKind: SidebarPointerKind): SensorDescriptor<any>[] {
++  if (pointerKind === 'coarse') {
++    return [{ sensor: TouchSensor, options: { activationConstraint: TOUCH_REORDER_CONSTRAINT } }]
++  }
++
++  return [
++    { sensor: PointerSensor, options: { activationConstraint: POINTER_REORDER_CONSTRAINT } },
++    { sensor: KeyboardSensor, options: { coordinateGetter: sortableKeyboardCoordinates } }
++  ]
++}
+diff --git a/apps/desktop/src/app/chat/sidebar/reorderable-list.tsx b/apps/desktop/src/app/chat/sidebar/reorderable-list.tsx
+index 736096572e..aac4d21fcb 100644
+--- a/apps/desktop/src/app/chat/sidebar/reorderable-list.tsx
++++ b/apps/desktop/src/app/chat/sidebar/reorderable-list.tsx
+@@ -1,8 +1,10 @@
+ import type { useSensors } from '@dnd-kit/core'
+-import { closestCenter, DndContext, type DragEndEvent } from '@dnd-kit/core'
++import { closestCenter, DndContext, type DragEndEvent, type DragStartEvent } from '@dnd-kit/core'
+ import { arrayMove, SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
+ import type * as React from 'react'
+ 
++import { triggerHaptic } from '@/lib/haptics'
++
+ // Sidebar reordering is a strictly vertical list. The dragged item's transform
+ // is rendered Y-only in useSortableBindings (no x, no scale); this just stops
+ // dnd-kit's auto-scroll from dragging the rail — or the window — sideways when
+@@ -26,6 +28,16 @@ export function ReorderableList({
+   onReorder: (ids: string[]) => void
+   sensors?: ReturnType<typeof useSensors>
+ }) {
++  const handleDragStart = ({ activatorEvent }: DragStartEvent) => {
++    // Touch reordering activates after a deliberate long-press (400ms) —
++    // confirm it took with a tap haptic. Pointer/keyboard drags activate
++    // immediately and don't need the ping. triggerHaptic's own gesture gate
++    // and rate limit apply unchanged. (TouchEvent is undefined in jsdom.)
++    if (typeof TouchEvent !== 'undefined' && activatorEvent instanceof TouchEvent) {
++      triggerHaptic('open')
++    }
++  }
++
+   const handleDragEnd = ({ activatorEvent, active, over }: DragEndEvent) => {
+     // dnd-kit only restores focus for keyboard drags; after a pointer drop the
+     // browser leaves :focus on the grab handle, which keeps a focus-within
+@@ -52,6 +64,7 @@ export function ReorderableList({
+       autoScroll={reorderAutoScroll}
+       collisionDetection={closestCenter}
+       onDragEnd={handleDragEnd}
++      onDragStart={handleDragStart}
+       sensors={sensors}
+     >
+       <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.tsx b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+index 41aa0abc2c..aad488c9fa 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+@@ -352,6 +352,9 @@ function SidebarSessionRowImpl({
+         actions={card ? undefined : actionsNode}
+         className={cn(
+           'group row-hover relative',
++          // Touch pans/callout suppression for reorderable rows live in
++          // styles.css (`button:has([data-reorder-handle])`) — Tailwind
++          // utilities are @layer'd and lose to the unlayered `button` rule.
+           card && SIDEBAR_ROW_CARD_MIN_H,
+           // Density-aware minimum heights for the inline (non-card) row: the
+           // metadata / preview lines below need the extra rows (#68119).
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index d0d37a9408..7da02d7af5 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3607,6 +3607,18 @@ html {
+     font-size: max(16px, 1em);
+     touch-action: manipulation;
+   }
++
++  /* Reorderable sidebar rows (any list whose rows carry a grab handle): the
++     browser owns vertical pans, so a quick swipe scrolls instead of arming the
++     long-press drag, and the deliberate long-press must not summon iOS's
++     native callout/selection loupe over the row it lifts. Unlayered on
++     purpose — it must beat the `button { touch-action: manipulation }` above,
++     which Tailwind utilities (always @layer'd) cannot. */
++  button:has([data-reorder-handle]) {
++    touch-action: pan-y;
++    -webkit-touch-callout: none;
++    user-select: none;
++  }
+ }
+ 
+ /* Keep transcript scrolling contained: no whole-page rubber-banding past the

@@ -1,0 +1,549 @@
+From d0f9a144faa56f039b52f1302bdf6b9e804874ce Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 16:38:31 +0800
+Subject: [PATCH 24/32] fix(desktop): web-mode attachment downloads go through
+ the browser
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+preview-attachment's download button always called the Electron IPC save
+bridge, which does not exist in the web app — every attachment download
+failed with 'Desktop file download bridge is unavailable'. Split on the
+bridge's presence: Electron keeps the IPC save dialog; web fetches the
+authenticated GET /api/files/download URL (same-origin credentials, token
+query when the connection carries one) and hands the blob to an <a
+download> anchor, failing visibly through the existing error toast on
+4xx/5xx.
+
+Filename derivation moved to lib/download-filename.ts (verbatim image
+helpers + new attachmentFilename: Content-Disposition name, else basename,
+else MIME-derived extension, never an invented one) so media.ts and the
+image hook share one seam instead of lib reaching into hooks.
+---
+ .../components/chat/preview-attachment.tsx    |  29 +++--
+ .../src/hooks/use-image-download.test.ts      |  40 ------
+ apps/desktop/src/hooks/use-image-download.ts  |  43 +-----
+ .../desktop/src/lib/download-filename.test.ts |  89 +++++++++++++
+ apps/desktop/src/lib/download-filename.ts     | 123 ++++++++++++++++++
+ apps/desktop/src/lib/media.remote.test.ts     |  74 +++++++++++
+ apps/desktop/src/lib/media.ts                 |  36 +++++
+ 7 files changed, 343 insertions(+), 91 deletions(-)
+ delete mode 100644 apps/desktop/src/hooks/use-image-download.test.ts
+ create mode 100644 apps/desktop/src/lib/download-filename.test.ts
+ create mode 100644 apps/desktop/src/lib/download-filename.ts
+
+diff --git a/apps/desktop/src/components/chat/preview-attachment.tsx b/apps/desktop/src/components/chat/preview-attachment.tsx
+index b0f102e824..ecef8c73a7 100644
+--- a/apps/desktop/src/components/chat/preview-attachment.tsx
++++ b/apps/desktop/src/components/chat/preview-attachment.tsx
+@@ -5,7 +5,7 @@ import { useSessionView } from '@/app/chat/session-view'
+ import { useI18n } from '@/i18n'
+ import { Download, MonitorPlay } from '@/lib/icons'
+ import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+-import { downloadGatewayMediaFile } from '@/lib/media'
++import { downloadGatewayFileInBrowser, downloadGatewayMediaFile } from '@/lib/media'
+ import { previewName } from '@/lib/preview-targets'
+ import { notifyError } from '@/store/notifications'
+ import { $previewTabSources, closePreviewForSource, openPreview, type PreviewRecordSource } from '@/store/preview'
+@@ -105,14 +105,25 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
+     setDownloading(true)
+ 
+     try {
+-      // Works in both modes: the Electron main process fetches the bytes
+-      // through the session's backend connection (local gateway or remote)
+-      // and prompts for a save location.
+-      const result = await downloadGatewayMediaFile(target)
+-
+-      if (mountedRef.current && result.saved) {
+-        setDownloaded(true)
+-        setTimeout(() => mountedRef.current && setDownloaded(false), 2000)
++      // Electron: the main process fetches the bytes through the session's
++      // backend connection (local gateway or remote) and prompts for a save
++      // location. Web (no IPC bridge): a browser download of the authenticated
++      // /api/files/download URL — without this branch the bridge check threw
++      // and every attachment download failed on the web app.
++      if (window.hermesDesktop?.saveGatewayFile) {
++        const result = await downloadGatewayMediaFile(target)
++
++        if (mountedRef.current && result.saved) {
++          setDownloaded(true)
++          setTimeout(() => mountedRef.current && setDownloaded(false), 2000)
++        }
++      } else {
++        await downloadGatewayFileInBrowser(target)
++
++        if (mountedRef.current) {
++          setDownloaded(true)
++          setTimeout(() => mountedRef.current && setDownloaded(false), 2000)
++        }
+       }
+     } catch (error) {
+       if (mountedRef.current) {
+diff --git a/apps/desktop/src/hooks/use-image-download.test.ts b/apps/desktop/src/hooks/use-image-download.test.ts
+deleted file mode 100644
+index 10b727aff1..0000000000
+--- a/apps/desktop/src/hooks/use-image-download.test.ts
++++ /dev/null
+@@ -1,40 +0,0 @@
+-import { describe, expect, it } from 'vitest'
+-
+-import { downloadFilename, imageFilename } from './use-image-download'
+-
+-describe('imageFilename', () => {
+-  it('takes the last path segment of a URL', () => {
+-    expect(imageFilename('https://v3.fal.media/files/kangaroo/pic.png')).toBe('pic.png')
+-  })
+-
+-  it('falls back to "image" when there is no usable segment', () => {
+-    expect(imageFilename('https://example.com/')).toBe('image')
+-    expect(imageFilename(undefined)).toBe('image')
+-  })
+-})
+-
+-describe('downloadFilename', () => {
+-  it('keeps a name that already has a known image extension', () => {
+-    expect(downloadFilename('https://example.com/a/photo.jpg', 'image/jpeg')).toBe('photo.jpg')
+-    expect(downloadFilename('https://example.com/a/photo.webp', '')).toBe('photo.webp')
+-  })
+-
+-  it('appends a MIME-derived extension to extensionless content hashes', () => {
+-    expect(downloadFilename('https://v3.fal.media/files/x/MKZV6h-RrKLVCOKp9bGfE_YuJPemAQ', 'image/jpeg')).toBe(
+-      'MKZV6h-RrKLVCOKp9bGfE_YuJPemAQ.jpg'
+-    )
+-    expect(downloadFilename('https://cdn.example.com/abc123', 'image/webp')).toBe('abc123.webp')
+-  })
+-
+-  it('handles MIME parameters and unknown types', () => {
+-    expect(downloadFilename('https://cdn.example.com/abc123', 'image/png; charset=binary')).toBe('abc123.png')
+-    expect(downloadFilename('https://cdn.example.com/abc123', 'application/octet-stream')).toBe('abc123.png')
+-    expect(downloadFilename('https://cdn.example.com/abc123', undefined)).toBe('abc123.png')
+-  })
+-
+-  it('does not treat a dotted hash suffix as an extension', () => {
+-    // A name like "photo.v2" has an extname but not a known image one — the
+-    // MIME extension still gets appended so the OS can open the file.
+-    expect(downloadFilename('https://cdn.example.com/photo.v2', 'image/png')).toBe('photo.v2.png')
+-  })
+-})
+diff --git a/apps/desktop/src/hooks/use-image-download.ts b/apps/desktop/src/hooks/use-image-download.ts
+index dbaecf30aa..97261eb543 100644
+--- a/apps/desktop/src/hooks/use-image-download.ts
++++ b/apps/desktop/src/hooks/use-image-download.ts
+@@ -1,50 +1,9 @@
+ import { useCallback, useState } from 'react'
+ 
++import { downloadFilename, imageFilename } from '@/lib/download-filename'
+ import { useI18n } from '@/i18n'
+ import { notify, notifyError } from '@/store/notifications'
+ 
+-const MIME_EXTENSIONS: Record<string, string> = {
+-  'image/bmp': '.bmp',
+-  'image/gif': '.gif',
+-  'image/jpeg': '.jpg',
+-  'image/png': '.png',
+-  'image/svg+xml': '.svg',
+-  'image/webp': '.webp'
+-}
+-
+-const KNOWN_IMAGE_EXTENSION_RE = /\.(?:apng|avif|bmp|gif|ico|jpe?g|png|svg|tiff?|webp)$/i
+-
+-export function imageFilename(src?: string): string {
+-  if (!src) {
+-    return 'image'
+-  }
+-
+-  try {
+-    return new URL(src, window.location.href).pathname.split('/').filter(Boolean).pop() || 'image'
+-  } catch {
+-    return src.split(/[\\/]/).filter(Boolean).pop() || 'image'
+-  }
+-}
+-
+-/** Filename for a browser-anchor download. Generated-image URLs (fal.media
+- *  etc.) often end in an extensionless content hash — without an extension the
+- *  OS save dialog shows "All Files" and the saved file won't open by
+- *  double-click, so append one derived from the blob's MIME type. */
+-export function downloadFilename(src: string, mimeType?: string): string {
+-  const base = imageFilename(src)
+-
+-  if (KNOWN_IMAGE_EXTENSION_RE.test(base)) {
+-    return base
+-  }
+-
+-  const type = String(mimeType || '')
+-    .split(';')[0]
+-    .trim()
+-    .toLowerCase()
+-
+-  return `${base}${MIME_EXTENSIONS[type] || '.png'}`
+-}
+-
+ function isMissingIpcHandler(error: unknown): boolean {
+   const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+ 
+diff --git a/apps/desktop/src/lib/download-filename.test.ts b/apps/desktop/src/lib/download-filename.test.ts
+new file mode 100644
+index 0000000000..64bc97442f
+--- /dev/null
++++ b/apps/desktop/src/lib/download-filename.test.ts
+@@ -0,0 +1,89 @@
++import { describe, expect, it } from 'vitest'
++
++import { attachmentFilename, dispositionFilename, downloadFilename, imageFilename } from './download-filename'
++
++describe('imageFilename', () => {
++  it('takes the last path segment of a URL', () => {
++    expect(imageFilename('https://v3.fal.media/files/kangaroo/pic.png')).toBe('pic.png')
++  })
++
++  it('falls back to "image" when there is no usable segment', () => {
++    expect(imageFilename('https://example.com/')).toBe('image')
++    expect(imageFilename(undefined)).toBe('image')
++  })
++})
++
++describe('downloadFilename', () => {
++  it('keeps a name that already has a known image extension', () => {
++    expect(downloadFilename('https://example.com/a/photo.jpg', 'image/jpeg')).toBe('photo.jpg')
++    expect(downloadFilename('https://example.com/a/photo.webp', '')).toBe('photo.webp')
++  })
++
++  it('appends a MIME-derived extension to extensionless content hashes', () => {
++    expect(downloadFilename('https://v3.fal.media/files/x/MKZV6h-RrKLVCOKp9bGfE_YuJPemAQ', 'image/jpeg')).toBe(
++      'MKZV6h-RrKLVCOKp9bGfE_YuJPemAQ.jpg'
++    )
++    expect(downloadFilename('https://cdn.example.com/abc123', 'image/webp')).toBe('abc123.webp')
++  })
++
++  it('handles MIME parameters and unknown types', () => {
++    expect(downloadFilename('https://cdn.example.com/abc123', 'image/png; charset=binary')).toBe('abc123.png')
++    expect(downloadFilename('https://cdn.example.com/abc123', 'application/octet-stream')).toBe('abc123.png')
++    expect(downloadFilename('https://cdn.example.com/abc123', undefined)).toBe('abc123.png')
++  })
++
++  it('does not treat a dotted hash suffix as an extension', () => {
++    // A name like "photo.v2" has an extname but not a known image one — the
++    // MIME extension still gets appended so the OS can open the file.
++    expect(downloadFilename('https://cdn.example.com/photo.v2', 'image/png')).toBe('photo.v2.png')
++  })
++})
++
++describe('dispositionFilename', () => {
++  it('parses a quoted plain filename', () => {
++    expect(dispositionFilename('attachment; filename="report.pdf"')).toBe('report.pdf')
++  })
++
++  it('parses a bare filename and an RFC 5987 UTF-8 filename', () => {
++    expect(dispositionFilename('attachment; filename=notes.txt')).toBe('notes.txt')
++    expect(dispositionFilename("attachment; filename*=UTF-8''%E6%8A%A5%E5%91%8A.pdf")).toBe('报告.pdf')
++  })
++
++  it('prefers the UTF-8 form and tolerates malformed encoding', () => {
++    expect(dispositionFilename("attachment; filename=\"a.txt\"; filename*=UTF-8''b.txt")).toBe('b.txt')
++    expect(dispositionFilename("attachment; filename*=UTF-8''%E0%A4%A; filename=\"ok.txt\"")).toBe('ok.txt')
++  })
++
++  it('returns null for absent or nameless headers', () => {
++    expect(dispositionFilename(null)).toBeNull()
++    expect(dispositionFilename('inline')).toBeNull()
++  })
++})
++
++describe('attachmentFilename', () => {
++  it('prefers the Content-Disposition name — the gateway knows the real one', () => {
++    expect(attachmentFilename('/tmp/x/whatever', 'application/pdf', 'attachment; filename="final report.pdf"')).toBe(
++      'final report.pdf'
++    )
++  })
++
++  it('keeps a basename that already carries an extension', () => {
++    expect(attachmentFilename('/tmp/hermes/report.pdf', 'application/pdf')).toBe('report.pdf')
++    expect(attachmentFilename('/tmp/hermes/a b.zip', 'application/zip')).toBe('a b.zip')
++  })
++
++  it('appends a MIME-derived extension to an extensionless path', () => {
++    expect(attachmentFilename('/tmp/hermes/data', 'text/csv')).toBe('data.csv')
++    expect(attachmentFilename('/tmp/hermes/hash', 'application/pdf')).toBe('hash.pdf')
++  })
++
++  it('routes extensionless images through the image-aware derivation', () => {
++    expect(attachmentFilename('/tmp/hermes/pic', 'image/webp')).toBe('pic.webp')
++  })
++
++  it('never invents an extension for unknown or binary MIME types', () => {
++    expect(attachmentFilename('/tmp/hermes/blob', 'application/octet-stream')).toBe('blob')
++    expect(attachmentFilename('/tmp/hermes/blob', undefined)).toBe('blob')
++    expect(attachmentFilename('/tmp/hermes/blob', 'application/x-custom; v=2')).toBe('blob')
++  })
++})
+diff --git a/apps/desktop/src/lib/download-filename.ts b/apps/desktop/src/lib/download-filename.ts
+new file mode 100644
+index 0000000000..7ed643bb21
+--- /dev/null
++++ b/apps/desktop/src/lib/download-filename.ts
+@@ -0,0 +1,123 @@
++/** Filename derivation for browser-anchor downloads (fetch → blob →
++ * `<a download>`): the anchor needs a name, and generated-file URLs (fal.media
++ * content hashes, gateway temp paths) often end extensionless — without an
++ * extension the OS save dialog shows "All Files" and the saved file won't open
++ * by double-click. */
++
++/** Image MIME → extension, for `downloadFilename` (the image hook's contract:
++ * unknown or binary types fall back to `.png`). */
++const IMAGE_MIME_EXTENSIONS: Record<string, string> = {
++  'image/bmp': '.bmp',
++  'image/gif': '.gif',
++  'image/jpeg': '.jpg',
++  'image/png': '.png',
++  'image/svg+xml': '.svg',
++  'image/webp': '.webp'
++}
++
++/** Non-image MIME → extension, for `attachmentFilename` (unknown types get NO
++ * invented extension — a bare name beats a wrong one). */
++const ATTACHMENT_MIME_EXTENSIONS: Record<string, string> = {
++  'application/json': '.json',
++  'application/pdf': '.pdf',
++  'application/zip': '.zip',
++  'application/x-zip-compressed': '.zip',
++  'application/gzip': '.gz',
++  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
++  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
++  'application/msword': '.doc',
++  'application/vnd.ms-excel': '.xls',
++  'text/csv': '.csv',
++  'text/markdown': '.md',
++  'text/plain': '.txt'
++}
++
++const KNOWN_IMAGE_EXTENSION_RE = /\.(?:apng|avif|bmp|gif|ico|jpe?g|png|svg|tiff?|webp)$/i
++
++/** Any plausible filename extension — unlike the image-specific regex, an
++ * attachment may carry any extension the OS can already open. */
++const ANY_EXTENSION_RE = /\.[A-Za-z0-9]{1,8}$/
++
++const normalizedMime = (mimeType?: string): string =>
++  String(mimeType || '')
++    .split(';')[0]
++    .trim()
++    .toLowerCase()
++
++export function imageFilename(src?: string): string {
++  if (!src) {
++    return 'image'
++  }
++
++  try {
++    return new URL(src, window.location.href).pathname.split('/').filter(Boolean).pop() || 'image'
++  } catch {
++    return src.split(/[\\/]/).filter(Boolean).pop() || 'image'
++  }
++}
++
++export function downloadFilename(src: string, mimeType?: string): string {
++  const base = imageFilename(src)
++
++  if (KNOWN_IMAGE_EXTENSION_RE.test(base)) {
++    return base
++  }
++
++  const type = normalizedMime(mimeType)
++
++  return `${base}${IMAGE_MIME_EXTENSIONS[type] || '.png'}`
++}
++
++/** `filename` (quoted or bare) or RFC 5987 `filename*=UTF-8''…` from a
++ * Content-Disposition header — the gateway's file routes always set it to the
++ * real on-disk name, which beats any client-side guess. */
++export function dispositionFilename(header: null | string | undefined): null | string {
++  if (!header) {
++    return null
++  }
++
++  const extended = /filename\*=(?:utf-8)?''([^;]+)/i.exec(header)
++
++  if (extended?.[1]) {
++    try {
++      return decodeURIComponent(extended[1].trim().replace(/^"|"$/g, ''))
++    } catch {
++      // Malformed percent-encoding — fall through to the plain form.
++    }
++  }
++
++  const plain = /filename="?([^";]+)"?/i.exec(header)
++
++  return plain?.[1]?.trim() || null
++}
++
++/** Name for a gateway file download: the response's Content-Disposition when
++ * the server sent one, else the path basename, else the basename plus a
++ * MIME-derived extension (image-aware so an extensionless image still gets
++ * its `.png`/`.jpg`). Never invents an extension for a name that has none and
++ * an unknown MIME — a bare name is better than a wrong one. */
++export function attachmentFilename(path: string, mimeType?: string, disposition?: null | string): string {
++  const header = dispositionFilename(disposition)
++
++  if (header) {
++    return header
++  }
++
++  const base = path.split(/[\\/]/).filter(Boolean).pop() || 'download'
++
++  if (ANY_EXTENSION_RE.test(base)) {
++    return base
++  }
++
++  const type = normalizedMime(mimeType)
++
++  if (!type || type === 'application/octet-stream') {
++    return base
++  }
++
++  if (type.startsWith('image/')) {
++    return downloadFilename(base, type)
++  }
++
++  return `${base}${ATTACHMENT_MIME_EXTENSIONS[type] ?? ''}`
++}
+diff --git a/apps/desktop/src/lib/media.remote.test.ts b/apps/desktop/src/lib/media.remote.test.ts
+index 6092db90f4..7731a973ea 100644
+--- a/apps/desktop/src/lib/media.remote.test.ts
++++ b/apps/desktop/src/lib/media.remote.test.ts
+@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { $connection } from '@/store/session'
+ 
+ import {
++  downloadGatewayFileInBrowser,
+   downloadGatewayMediaFile,
+   filePathFromMediaPath,
+   gatewayMediaDataUrl,
+@@ -268,3 +269,76 @@ describe('downloadGatewayMediaFile', () => {
+     )
+   })
+ })
++
++describe('downloadGatewayFileInBrowser', () => {
++  const anchorClicks: string[] = []
++
++  const stubFetch = (status: number, mime: string, headers: Record<string, string> = {}) => {
++    const fetchMock = vi.fn(async () => ({
++      headers: new Headers(headers),
++      ok: status >= 200 && status < 300,
++      status,
++      async blob() {
++        return new Blob(['x'], { type: mime })
++      }
++    }))
++
++    vi.stubGlobal('fetch', fetchMock)
++
++    return fetchMock
++  }
++
++  beforeEach(() => {
++    anchorClicks.length = 0
++    vi.stubGlobal('window', {
++      location: { origin: 'https://web.app' },
++      setTimeout: () => 0
++    })
++    URL.createObjectURL = vi.fn(() => 'blob:download')
++    URL.revokeObjectURL = vi.fn()
++    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
++      anchorClicks.push(this.download)
++    })
++  })
++
++  afterEach(() => {
++    delete (URL as { createObjectURL?: unknown }).createObjectURL
++    delete (URL as { revokeObjectURL?: unknown }).revokeObjectURL
++    vi.restoreAllMocks()
++    vi.unstubAllGlobals()
++    $connection.set(null)
++  })
++
++  it('fetches the authenticated download URL with a token query when one exists', async () => {
++    const fetchMock = stubFetch(200, 'application/pdf')
++    $connection.set({ mode: 'remote', baseUrl: 'https://web.app', token: 's e/cret' } as never)
++
++    await downloadGatewayFileInBrowser('file:///tmp/a%20b.pdf')
++
++    expect(fetchMock).toHaveBeenCalledWith(
++      'https://web.app/api/files/download?path=%2Ftmp%2Fa%20b.pdf&token=s%20e%2Fcret',
++      { credentials: 'same-origin' }
++    )
++    expect(anchorClicks).toEqual(['a b.pdf'])
++  })
++
++  it('falls back to same-origin credentials when the connection carries no token', async () => {
++    const fetchMock = stubFetch(200, 'text/csv', { 'content-disposition': 'attachment; filename="rows.csv"' })
++    $connection.set({ authMode: 'oauth', mode: 'remote', token: null } as never)
++
++    await downloadGatewayFileInBrowser('/tmp/export-2026')
++
++    expect(fetchMock).toHaveBeenCalledWith('https://web.app/api/files/download?path=%2Ftmp%2Fexport-2026', {
++      credentials: 'same-origin'
++    })
++    expect(anchorClicks).toEqual(['rows.csv'])
++  })
++
++  it('throws a visible error on a failed download instead of downloading silently', async () => {
++    stubFetch(404, 'text/plain')
++    $connection.set({ mode: 'remote', baseUrl: 'https://web.app', token: 't' } as never)
++
++    await expect(downloadGatewayFileInBrowser('/tmp/gone.pdf')).rejects.toThrow('Download failed: HTTP 404')
++    expect(anchorClicks).toEqual([])
++  })
++})
+diff --git a/apps/desktop/src/lib/media.ts b/apps/desktop/src/lib/media.ts
+index cd5d6b3c46..44b9f9224b 100644
+--- a/apps/desktop/src/lib/media.ts
++++ b/apps/desktop/src/lib/media.ts
+@@ -1,4 +1,5 @@
+ import { readDesktopFileDataUrl } from '@/lib/desktop-fs'
++import { attachmentFilename } from '@/lib/download-filename'
+ import { capitalize } from '@/lib/text'
+ import { $connection } from '@/store/session'
+ 
+@@ -234,6 +235,41 @@ export async function downloadGatewayMediaFile(
+   })
+ }
+ 
++/** Browser download of a gateway-local file for shells without the Electron
++ *  save bridge (the web app): fetch GET /api/files/download — same-origin
++ *  credentials carry the session, a token connection adds the `?token=` query
++ *  the route accepts in addition to cookie auth (web-bridge connections are
++ *  always mode 'remote' with baseUrl = this origin) — then hand the blob to an
++ *  `<a download>` anchor. The anchor form (vs window.open) keeps the save flow
++ *  working on iOS Safari and names the file from Content-Disposition. */
++export async function downloadGatewayFileInBrowser(path: string): Promise<void> {
++  const conn = $connection.get()
++  const filePath = filePathFromMediaPath(path)
++  const file = encodeURIComponent(filePath)
++  const token = conn?.token ? `&token=${encodeURIComponent(conn.token)}` : ''
++  const base = conn?.baseUrl || window.location.origin
++
++  const response = await fetch(`${base}/api/files/download?path=${file}${token}`, {
++    credentials: 'same-origin'
++  })
++
++  if (!response.ok) {
++    throw new Error(`Download failed: HTTP ${response.status}`)
++  }
++
++  const blob = await response.blob()
++  const blobUrl = URL.createObjectURL(blob)
++  const link = document.createElement('a')
++
++  link.href = blobUrl
++  link.download = attachmentFilename(filePath, blob.type, response.headers.get('content-disposition'))
++  link.rel = 'noopener noreferrer'
++  document.body.appendChild(link)
++  link.click()
++  link.remove()
++  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 30_000)
++}
++
+ export function mediaDisplayLabel(path: string): string {
+   const escaped = mediaName(path).replace(/[[\]\\]/g, '\\$&')
+   const kind = mediaKind(path)

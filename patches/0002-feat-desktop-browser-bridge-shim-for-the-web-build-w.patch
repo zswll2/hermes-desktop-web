@@ -1,0 +1,742 @@
+From 1e460aca51dd009d580edff0ef491b795a9a17cc Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 08:26:52 +0800
+Subject: [PATCH 02/32] feat(desktop): browser bridge shim for the web build
+ (window.hermesDesktop)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+createWebBridge() implements the P0 data plane members for real — same-origin
+REST via api() (X-Hermes-Session-Token header in token mode, cookies in gated
+mode), a synthetic always-remote HermesConnection, per-dial WS URL minting
+(ws-ticket when the dashboard gate is on, injected token on loopback) — and
+structurally degrades every machine-bound member with WebBridgeCapabilityError
+(one-time console.warn per capability) so misrouted calls are visible instead
+of silent undefined. TypeScript verifies member completeness against
+Window['hermesDesktop']; 19 vitest contract tests pin the auth/fetch shapes.
+
+index.html gains the iOS install surface (manifest link, apple-mobile-web-app
+metas, relative icon paths) and public/manifest.webmanifest (no SW by design:
+the server injects per-process session tokens into HTML).
+---
+ apps/desktop/index.html                       |   9 +-
+ apps/desktop/public/manifest.webmanifest      |  15 +
+ apps/desktop/src/lib/bridge/index.ts          |  19 +
+ apps/desktop/src/lib/bridge/install.ts        |   9 +
+ .../desktop/src/lib/bridge/web-bridge.test.ts | 210 ++++++++++
+ apps/desktop/src/lib/bridge/web-bridge.ts     | 392 ++++++++++++++++++
+ apps/desktop/src/main.tsx                     |   3 +
+ 7 files changed, 654 insertions(+), 3 deletions(-)
+ create mode 100644 apps/desktop/public/manifest.webmanifest
+ create mode 100644 apps/desktop/src/lib/bridge/index.ts
+ create mode 100644 apps/desktop/src/lib/bridge/install.ts
+ create mode 100644 apps/desktop/src/lib/bridge/web-bridge.test.ts
+ create mode 100644 apps/desktop/src/lib/bridge/web-bridge.ts
+
+diff --git a/apps/desktop/index.html b/apps/desktop/index.html
+index 831478f6e9..afb14d768e 100644
+--- a/apps/desktop/index.html
++++ b/apps/desktop/index.html
+@@ -5,9 +5,12 @@
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <meta name="color-scheme" content="light dark" />
+     <meta name="theme-color" content="#0a0a0a" />
+-    <link rel="icon" type="image/png" sizes="180x180" href="/apple-touch-icon.png" />
+-    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+-    <link rel="shortcut icon" href="/apple-touch-icon.png" />
++    <meta name="apple-mobile-web-app-capable" content="yes" />
++    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
++    <link rel="manifest" href="./manifest.webmanifest" />
++    <link rel="icon" type="image/png" sizes="180x180" href="./apple-touch-icon.png" />
++    <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
++    <link rel="shortcut icon" href="./apple-touch-icon.png" />
+     <title>Hermes</title>
+     <script>
+       // Pre-paint the themed background before the app bundle loads. Without
+diff --git a/apps/desktop/public/manifest.webmanifest b/apps/desktop/public/manifest.webmanifest
+new file mode 100644
+index 0000000000..e649daa345
+--- /dev/null
++++ b/apps/desktop/public/manifest.webmanifest
+@@ -0,0 +1,15 @@
++{
++  "name": "Hermes",
++  "start_url": "./",
++  "scope": "./",
++  "display": "standalone",
++  "background_color": "#0a0a0a",
++  "theme_color": "#0a0a0a",
++  "icons": [
++    {
++      "src": "./apple-touch-icon.png",
++      "sizes": "1024x1024",
++      "type": "image/png"
++    }
++  ]
++}
+diff --git a/apps/desktop/src/lib/bridge/index.ts b/apps/desktop/src/lib/bridge/index.ts
+new file mode 100644
+index 0000000000..554aae6249
+--- /dev/null
++++ b/apps/desktop/src/lib/bridge/index.ts
+@@ -0,0 +1,19 @@
++// The single entry point NEW code should use to reach the desktop bridge.
++// Existing call sites that read `window.hermesDesktop` directly keep working
++// (the web build installs the same object at startup); migrate them to
++// `getBridge()` opportunistically via mechanical PRs, not feature work.
++export function isWebBuild(): boolean {
++  return __HERMES_WEB__
++}
++
++export function getBridge(): Window['hermesDesktop'] {
++  const bridge = window.hermesDesktop
++
++  if (!bridge) {
++    throw new Error('hermesDesktop bridge is not installed (web build missing its install shim?)')
++  }
++
++  return bridge
++}
++
++export { WebApiAuthError, WebApiError, WebBridgeCapabilityError } from './web-bridge'
+diff --git a/apps/desktop/src/lib/bridge/install.ts b/apps/desktop/src/lib/bridge/install.ts
+new file mode 100644
+index 0000000000..d07f7b383e
+--- /dev/null
++++ b/apps/desktop/src/lib/bridge/install.ts
+@@ -0,0 +1,9 @@
++// Must be the FIRST import in src/main.tsx: it installs the browser bridge
++// before any module reads `window.hermesDesktop`. In the Electron build the
++// `__HERMES_WEB__` define is `'false'`, so this branch is dead-code-eliminated
++// and web-bridge.ts never enters the bundle.
++import { createWebBridge } from './web-bridge'
++
++if (__HERMES_WEB__ && typeof window !== 'undefined' && !window.hermesDesktop) {
++  window.hermesDesktop = createWebBridge()
++}
+diff --git a/apps/desktop/src/lib/bridge/web-bridge.test.ts b/apps/desktop/src/lib/bridge/web-bridge.test.ts
+new file mode 100644
+index 0000000000..97b1f8d4fa
+--- /dev/null
++++ b/apps/desktop/src/lib/bridge/web-bridge.test.ts
+@@ -0,0 +1,210 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { createWebBridge, WebApiAuthError, WebApiError, WebBridgeCapabilityError } from './web-bridge'
++
++import { getBridge } from './index'
++
++type FetchMock = ReturnType<typeof vi.fn>
++
++function mockFetch(status = 200, body: unknown = {}): FetchMock {
++  const fn = vi.fn(async () =>
++    status === 204
++      ? new Response(null, { status })
++      : new Response(typeof body === 'string' ? body : JSON.stringify(body), {
++          status,
++          headers: { 'content-type': 'application/json' }
++        })
++  )
++
++  vi.stubGlobal('fetch', fn)
++
++  return fn
++}
++
++const authedFetchCall = (fn: FetchMock) => fn.mock.calls[0] as unknown as [string, RequestInit]
++
++beforeEach(() => {
++  window.__HERMES_SESSION_TOKEN__ = undefined
++  window.__HERMES_AUTH_REQUIRED__ = undefined
++})
++
++afterEach(() => {
++  vi.unstubAllGlobals()
++})
++
++describe('web-bridge api()', () => {
++  it('GET requests send no body and no content-type', async () => {
++    const fn = mockFetch(200, { ok: true })
++    const bridge = createWebBridge()
++    const result = await bridge.api<{ ok: boolean }>({ path: '/api/profiles/sessions/sidebar' })
++    const [url, init] = authedFetchCall(fn)
++    expect(url).toBe('/api/profiles/sessions/sidebar')
++    expect(init.method).toBe('GET')
++    expect(init.body).toBeUndefined()
++    expect(new Headers(init.headers).get('content-type')).toBeNull()
++    expect(init.credentials).toBe('same-origin')
++    expect(result).toEqual({ ok: true })
++  })
++
++  it('a GET with a body field still sends no body (GET/no-body semantics)', async () => {
++    const fn = mockFetch(200, {})
++    const bridge = createWebBridge()
++    await bridge.api({ path: '/api/x', method: 'GET', body: { ignored: true } })
++    const [, init] = authedFetchCall(fn)
++    expect(init.body).toBeUndefined()
++  })
++
++  it('non-GET requests JSON-serialize the body and set content-type', async () => {
++    const fn = mockFetch(200, { renamed: true })
++    const bridge = createWebBridge()
++    await bridge.api<{ renamed: boolean }>({
++      path: '/api/sessions/abc',
++      method: 'PATCH',
++      body: { title: 'new' }
++    })
++    const [url, init] = authedFetchCall(fn)
++    expect(url).toBe('/api/sessions/abc')
++    expect(init.method).toBe('PATCH')
++    expect(init.body).toBe(JSON.stringify({ title: 'new' }))
++    expect(new Headers(init.headers).get('content-type')).toBe('application/json')
++  })
++
++  it('attaches the injected session token header in token mode', async () => {
++    const fn = mockFetch(200, {})
++    window.__HERMES_SESSION_TOKEN__ = 'tok-1'
++    const bridge = createWebBridge()
++    await bridge.api({ path: '/api/config' })
++    const [, init] = authedFetchCall(fn)
++    expect(new Headers(init.headers).get('X-Hermes-Session-Token')).toBe('tok-1')
++  })
++
++  it('appends the profile as a query param (merging with existing query)', async () => {
++    const fn = mockFetch(200, {})
++    const bridge = createWebBridge()
++    await bridge.api({ path: '/api/fs/read-data-url?path=%2Fa', profile: 'pro' })
++    const [url] = authedFetchCall(fn)
++    expect(url).toBe('/api/fs/read-data-url?path=%2Fa&profile=pro')
++  })
++
++  it('401/403 reject with WebApiAuthError (re-login path)', async () => {
++    mockFetch(401, { error: 'unauthenticated' })
++    const bridge = createWebBridge()
++    await expect(bridge.api({ path: '/api/config' })).rejects.toBeInstanceOf(WebApiAuthError)
++  })
++
++  it('other non-2xx statuses reject with WebApiError carrying the status', async () => {
++    mockFetch(500, 'boom')
++    const bridge = createWebBridge()
++    const error = await bridge.api({ path: '/api/config' }).catch((e: unknown) => e)
++    expect(error).toBeInstanceOf(WebApiError)
++    expect((error as WebApiError).status).toBe(500)
++  })
++
++  it('multipart upload requests reject with a capability error (out of P0 scope)', async () => {
++    const bridge = createWebBridge()
++    await expect(
++      bridge.api({ path: '/api/upload', upload: { filename: 'a.png', bytes: new ArrayBuffer(1) } })
++    ).rejects.toBeInstanceOf(WebBridgeCapabilityError)
++  })
++})
++
++describe('web-bridge getGatewayWsUrl()', () => {
++  it('token mode builds the URL from the injected token without any network call', async () => {
++    const fn = mockFetch(200, {})
++    window.__HERMES_SESSION_TOKEN__ = 'tok-9'
++    const bridge = createWebBridge()
++    const result = await bridge.getGatewayWsUrl()
++    expect(result).toEqual({
++      ok: true,
++      wsUrl: `ws://${window.location.host}/api/ws?token=tok-9`
++    })
++    expect(fn).not.toHaveBeenCalled()
++  })
++
++  it('gated mode mints a single-use ticket and dials with it', async () => {
++    const fn = mockFetch(200, { ticket: 'tk-1', ttl_seconds: 30 })
++    window.__HERMES_AUTH_REQUIRED__ = true
++    const bridge = createWebBridge()
++    const result = await bridge.getGatewayWsUrl()
++    const [url, init] = authedFetchCall(fn)
++    expect(url).toBe('/api/auth/ws-ticket')
++    expect(init.method).toBe('POST')
++    expect(init.credentials).toBe('same-origin')
++    expect(result).toEqual({ ok: true, wsUrl: `ws://${window.location.host}/api/ws?ticket=tk-1` })
++  })
++
++  it('an expired cookie (401 on mint) maps to needsOauthLogin for the re-login UX', async () => {
++    mockFetch(401, {})
++    window.__HERMES_AUTH_REQUIRED__ = true
++    const bridge = createWebBridge()
++    const result = await bridge.getGatewayWsUrl()
++    expect(result).toEqual({ ok: false, needsOauthLogin: true, error: expect.any(String) })
++  })
++})
++
++describe('web-bridge getConnection()', () => {
++  it('synthesizes a remote-url connection in token mode', async () => {
++    window.__HERMES_SESSION_TOKEN__ = 'tok-2'
++    const bridge = createWebBridge()
++    const conn = await bridge.getConnection()
++    expect(conn.mode).toBe('remote')
++    expect(conn.remoteKind).toBe('url')
++    expect(conn.authMode).toBe('token')
++    expect(conn.baseUrl).toBe(window.location.origin)
++    expect(conn.wsUrl).toContain('token=tok-2')
++    expect(conn.isFullscreen).toBe(false)
++    expect(conn.windowButtonPosition).toBeNull()
++  })
++
++  it('gated mode reports oauth and leaves the cached wsUrl empty (always mint)', async () => {
++    window.__HERMES_AUTH_REQUIRED__ = true
++    const bridge = createWebBridge()
++    const conn = await bridge.getConnection()
++    expect(conn.authMode).toBe('oauth')
++    expect(conn.wsUrl).toBe('')
++  })
++})
++
++describe('web-bridge degraded members', () => {
++  it('reject with WebBridgeCapabilityError and carry the capability name', async () => {
++    const bridge = createWebBridge()
++    const error = await bridge.getVersion().catch((e: unknown) => e)
++    expect(error).toBeInstanceOf(WebBridgeCapabilityError)
++    expect((error as WebBridgeCapabilityError).capability).toBe('getVersion')
++  })
++
++  it('nested object members degrade too', async () => {
++    const bridge = createWebBridge()
++    await expect(bridge.updates.check()).rejects.toBeInstanceOf(WebBridgeCapabilityError)
++    await expect(bridge.connections.list()).rejects.toBeInstanceOf(WebBridgeCapabilityError)
++  })
++
++  it('subscriptions return an unsubscribe without ever firing', () => {
++    const bridge = createWebBridge()
++
++    const off = bridge.onBootProgress(() => {
++      throw new Error('must not fire')
++    })
++
++    expect(typeof off).toBe('function')
++    expect(() => off()).not.toThrow()
++  })
++
++  it('clipboard without the async API (insecure context) degrades honestly', async () => {
++    const bridge = createWebBridge()
++    await expect(bridge.readClipboard()).rejects.toBeInstanceOf(WebBridgeCapabilityError)
++  })
++
++  it('openExternal refuses non-http(s) schemes', async () => {
++    const bridge = createWebBridge()
++    await expect(bridge.openExternal('file:///etc/passwd')).rejects.toBeInstanceOf(WebBridgeCapabilityError)
++  })
++})
++
++describe('bridge install contract', () => {
++  it('getBridge() returns the same object installed on window', async () => {
++    window.hermesDesktop = createWebBridge()
++    expect(getBridge()).toBe(window.hermesDesktop)
++    await expect(window.hermesDesktop.api({ path: '/x' })).rejects.toBeInstanceOf(Error)
++  })
++})
+diff --git a/apps/desktop/src/lib/bridge/web-bridge.ts b/apps/desktop/src/lib/bridge/web-bridge.ts
+new file mode 100644
+index 0000000000..cad6613b44
+--- /dev/null
++++ b/apps/desktop/src/lib/bridge/web-bridge.ts
+@@ -0,0 +1,392 @@
++// Browser implementation of the `window.hermesDesktop` bridge.
++//
++// The web build runs the SAME renderer source as Electron; every native
++// capability the renderer expects arrives through this shim instead of the
++// preload script. REST goes same-origin through `api()` (the single REST choke
++// point — `src/api/client.ts` and the direct-call domain files all land here),
++// the WebSocket URL is minted per dial (cookie → ws-ticket when the dashboard
++// gate is on, injected session token on loopback), and everything that needs a
++// machine (windows, overlays, local fs dialogs, terminals, updates) rejects
++// with `WebBridgeCapabilityError` instead of silently returning undefined.
++import { buildHermesWebSocketUrl, type GatewayWsUrlResult, type WebSocketAuthParam } from '@hermes/shared'
++
++import type { HermesApiRequest, HermesConnection } from '@/global'
++
++export class WebBridgeCapabilityError extends Error {
++  readonly capability: string
++
++  constructor(capability: string) {
++    super(`This capability is not available in the browser: ${capability}`)
++    this.name = 'WebBridgeCapabilityError'
++    this.capability = capability
++  }
++}
++
++export class WebApiError extends Error {
++  readonly status: number
++
++  constructor(status: number, message: string) {
++    super(message)
++    this.name = 'WebApiError'
++    this.status = status
++  }
++}
++
++/** 401/403 from the backend: the session (cookie or injected token) is gone. */
++export class WebApiAuthError extends WebApiError {
++  constructor(status: number, message: string) {
++    super(status, message)
++    this.name = 'WebApiAuthError'
++  }
++}
++
++declare global {
++  interface Window {
++    // Injected into /app's index.html by the dashboard server (same
++    // convention as the dashboard SPA — web_server_dashboard.py).
++    __HERMES_SESSION_TOKEN__?: string
++    __HERMES_AUTH_REQUIRED__?: boolean
++  }
++}
++
++const SESSION_HEADER = 'X-Hermes-Session-Token'
++
++const warned = new Set<string>()
++
++function warnOnce(capability: string): void {
++  if (warned.has(capability)) {return}
++  warned.add(capability)
++   
++  console.warn('[web-bridge] unavailable:', capability)
++}
++
++/**
++ * Structured degradation for a required bridge member the browser cannot
++ * offer. Rejects with `WebBridgeCapabilityError` on first use (and warns once
++ * per capability) so misrouted calls are visible in the console during
++ * acceptance instead of failing as silent `undefined`.
++ */
++function unavailable(capability: string): (...args: unknown[]) => Promise<never> {
++  return (...args: unknown[]) => {
++    warnOnce(capability)
++
++    return Promise.reject(new WebBridgeCapabilityError(capability))
++  }
++}
++
++// A subscription with no web-side event source. Subscribing succeeds and the
++// unsubscribe is a no-op; the callback simply never fires.
++const neverFires = () => () => {}
++
++function authHeaders(hasJsonBody: boolean): Headers {
++  const headers = new Headers()
++
++  if (hasJsonBody) {headers.set('content-type', 'application/json')}
++  const token = window.__HERMES_SESSION_TOKEN__
++
++  if (token) {headers.set(SESSION_HEADER, token)}
++
++  return headers
++}
++
++function withProfileParam(path: string, profile?: string | null): string {
++  if (!profile) {return path}
++  const sep = path.includes('?') ? '&' : '?'
++
++  return `${path}${sep}profile=${encodeURIComponent(profile)}`
++}
++
++async function webApi<T>(request: HermesApiRequest): Promise<T> {
++  if (request.upload) {
++    warnOnce('api.upload')
++
++    return Promise.reject(new WebBridgeCapabilityError('api.upload'))
++  }
++
++  const method = (request.method ?? 'GET').toUpperCase()
++  const hasBody = request.body !== undefined && method !== 'GET' && method !== 'HEAD'
++
++  const res = await fetch(withProfileParam(request.path, request.profile), {
++    method,
++    headers: authHeaders(hasBody),
++    body: hasBody ? JSON.stringify(request.body) : undefined,
++    credentials: 'same-origin',
++    signal: request.timeoutMs ? AbortSignal.timeout(request.timeoutMs) : undefined
++  })
++
++  if (res.status === 401 || res.status === 403) {
++    throw new WebApiAuthError(res.status, `${res.status}: ${await res.text().catch(() => res.statusText)}`)
++  }
++
++  if (!res.ok) {
++    throw new WebApiError(res.status, `${res.status}: ${await res.text().catch(() => res.statusText)}`)
++  }
++
++  const text = await res.text()
++
++  return (text ? (JSON.parse(text) as T) : (undefined as T)) ?? (null as T)
++}
++
++/** Auth pair for a WS dial: ticket (gated) or injected token (loopback). */
++async function buildWsAuthParam(): Promise<WebSocketAuthParam> {
++  if (window.__HERMES_AUTH_REQUIRED__) {
++    const res = await fetch('/api/auth/ws-ticket', { method: 'POST', credentials: 'same-origin' })
++
++    if (!res.ok) {
++      // Session cookie expired — the existing GatewayReauthRequiredError UX
++      // picks this up through `needsOauthLogin`.
++      throw new WebApiAuthError(res.status, `/api/auth/ws-ticket: HTTP ${res.status}`)
++    }
++
++    const data = (await res.json()) as { ticket: string }
++
++    return ['ticket', data.ticket]
++  }
++
++  return ['token', window.__HERMES_SESSION_TOKEN__ ?? '']
++}
++
++async function webGetGatewayWsUrl(_profile?: null | string): Promise<GatewayWsUrlResult> {
++  try {
++    const authParam = await buildWsAuthParam()
++
++    return { ok: true, wsUrl: buildHermesWebSocketUrl({ path: '/api/ws', authParam }) }
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error)
++
++    if (error instanceof WebApiAuthError) {return { ok: false, needsOauthLogin: true, error: message }}
++
++    return { ok: false, error: message }
++  }
++}
++
++// The browser is always "remote": one same-origin backend, no process pool.
++// mode='remote' makes the existing remote paths (desktop-fs REST, desktop-git
++// REST) engage without touching those modules.
++async function webGetConnection(_profile?: null | string): Promise<HermesConnection> {
++  const gated = window.__HERMES_AUTH_REQUIRED__ === true
++  const token = window.__HERMES_SESSION_TOKEN__ ?? ''
++
++  return {
++    baseUrl: window.location.origin,
++    isFullscreen: false,
++    nativeOverlayWidth: 0,
++    token,
++    logs: [],
++    windowButtonPosition: null,
++    mode: 'remote',
++    remoteKind: 'url',
++    authMode: gated ? 'oauth' : 'token',
++    source: 'settings',
++    // oauth-mode dials always mint a fresh ticket; the cached wsUrl only
++    // matters as the token-mode fallback, so leave it empty when gated.
++    wsUrl: gated ? '' : buildHermesWebSocketUrl({ path: '/api/ws', authParam: ['token', token] })
++  }
++}
++
++// Fallback for direct `readFileDataUrl` call sites; the remote branch of
++// desktop-fs.ts (media rendering) goes through `api()` instead.
++async function webReadFileDataUrl(path: string): Promise<string> {
++  const res = await fetch(withProfileParam(`/api/fs/read-data-url?path=${encodeURIComponent(path)}`), {
++    headers: authHeaders(false),
++    credentials: 'same-origin'
++  })
++
++  if (!res.ok) {throw new WebApiError(res.status, `read-data-url: HTTP ${res.status}`)}
++  const data = (await res.json()) as string | { dataUrl?: string }
++
++  return typeof data === 'string' ? data : (data.dataUrl ?? '')
++}
++
++async function webReadClipboard(): Promise<string> {
++  if (!navigator.clipboard) {
++    warnOnce('readClipboard')
++
++    return Promise.reject(new WebBridgeCapabilityError('readClipboard'))
++  }
++
++  return navigator.clipboard.readText()
++}
++
++async function webWriteClipboard(text: string): Promise<boolean> {
++  if (!navigator.clipboard) {
++    warnOnce('writeClipboard')
++
++    return Promise.reject(new WebBridgeCapabilityError('writeClipboard'))
++  }
++
++  await navigator.clipboard.writeText(text)
++
++  return true
++}
++
++async function webOpenExternal(url: string): Promise<void> {
++  if (!/^https?:\/\//i.test(url)) {
++    warnOnce('openExternal')
++
++    return Promise.reject(new WebBridgeCapabilityError(`openExternal(${url})`))
++  }
++
++  window.open(url, '_blank', 'noopener,noreferrer')
++}
++
++async function webNotify(payload: {
++  body?: string
++  silent?: boolean
++  title?: string
++}): Promise<boolean> {
++  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {return false}
++  new Notification(payload.title || 'Hermes', { body: payload.body, silent: payload.silent })
++
++  return true
++}
++
++export function createWebBridge(): Window['hermesDesktop'] {
++  return {
++    // ── Real implementations (P0 data plane) ──
++    api: webApi,
++    getConnection: webGetConnection,
++    getGatewayWsUrl: webGetGatewayWsUrl,
++    revalidateConnection: async () => ({ ok: true, rebuilt: false }),
++    touchBackend: async () => ({ ok: true }),
++    readFileDataUrl: webReadFileDataUrl,
++    readClipboard: webReadClipboard,
++    writeClipboard: webWriteClipboard,
++    openExternal: webOpenExternal,
++    notify: webNotify,
++    // No peer windows exist in a browser tab — every ambient cue is ours.
++    claimAmbientCue: async () => true,
++
++    // ── Honest static capability values ──
++    glassSupported: false,
++    translucencySupported: false,
++    localModelsEnabled: false,
++
++    // ── Subscriptions with no web event source: subscribe, never fire ──
++    onBrowserPopoutClosed: neverFires,
++    onPreviewFileChanged: neverFires,
++    onBackendExit: neverFires,
++    onBootProgress: neverFires,
++    onBootstrapEvent: neverFires,
++    onFoundInPage: neverFires,
++    onOpenFindBarRequested: neverFires,
++
++    // ── Window/overlay surfaces: fire-and-forget pushes are no-ops, ──
++    // ── everything returning a Promise degrades structurally.     ──
++    petOverlay: {
++      open: unavailable('petOverlay.open'),
++      close: unavailable('petOverlay.close'),
++      setBounds: () => {},
++      setIgnoreMouse: () => {},
++      setFocusable: () => {},
++      pushState: () => {},
++      control: () => {},
++      onState: neverFires,
++      onControl: neverFires
++    },
++    quickEntry: {
++      getSettings: unavailable('quickEntry.getSettings'),
++      setSettings: unavailable('quickEntry.setSettings'),
++      submit: () => {},
++      dismiss: () => {},
++      pushState: () => {},
++      onState: neverFires,
++      onSubmit: neverFires,
++      onShown: neverFires
++    },
++
++    // ── Structured degradation for every remaining member ──
++    getProfileRoutes: unavailable('getProfileRoutes'),
++    getPoolLimits: unavailable('getPoolLimits'),
++    setPoolLimits: unavailable('setPoolLimits'),
++    openSessionWindow: unavailable('openSessionWindow'),
++    openSessionInTerminal: unavailable('openSessionInTerminal'),
++    openWindow: unavailable('openWindow'),
++    openBrowserWindow: unavailable('openBrowserWindow'),
++    getBootProgress: unavailable('getBootProgress'),
++    getConnectionConfig: unavailable('getConnectionConfig'),
++    saveConnectionConfig: unavailable('saveConnectionConfig'),
++    applyConnectionConfig: unavailable('applyConnectionConfig'),
++    testConnectionConfig: unavailable('testConnectionConfig'),
++    getSecretStorageEncryption: unavailable('getSecretStorageEncryption'),
++    setSecretStorageEncryption: unavailable('setSecretStorageEncryption'),
++    connections: {
++      list: unavailable('connections.list'),
++      save: unavailable('connections.save'),
++      remove: unavailable('connections.remove'),
++      setPrimary: unavailable('connections.setPrimary'),
++      test: unavailable('connections.test')
++    },
++    sshConfigHosts: unavailable('sshConfigHosts'),
++    sshResolveHost: unavailable('sshResolveHost'),
++    probeConnectionConfig: unavailable('probeConnectionConfig'),
++    oauthLoginConnectionConfig: unavailable('oauthLoginConnectionConfig'),
++    oauthLogoutConnectionConfig: unavailable('oauthLogoutConnectionConfig'),
++    cloud: {
++      status: unavailable('cloud.status'),
++      login: unavailable('cloud.login'),
++      logout: unavailable('cloud.logout'),
++      discover: unavailable('cloud.discover'),
++      agentSignIn: unavailable('cloud.agentSignIn')
++    },
++    profile: {
++      get: unavailable('profile.get'),
++      remember: unavailable('profile.remember'),
++      set: unavailable('profile.set')
++    },
++    requestMicrophoneAccess: unavailable('requestMicrophoneAccess'),
++    readFileText: unavailable('readFileText'),
++    selectPaths: unavailable('selectPaths'),
++    saveImageFromUrl: unavailable('saveImageFromUrl'),
++    saveImageBuffer: unavailable('saveImageBuffer'),
++    saveClipboardImage: unavailable('saveClipboardImage'),
++    // Sync member: File objects picked in a browser carry no real path.
++    getPathForFile: () => '',
++    normalizePreviewTarget: unavailable('normalizePreviewTarget'),
++    watchPreviewFile: unavailable('watchPreviewFile'),
++    stopPreviewFileWatch: unavailable('stopPreviewFileWatch'),
++    fetchLinkTitle: unavailable('fetchLinkTitle'),
++    sanitizeWorkspaceCwd: unavailable('sanitizeWorkspaceCwd'),
++    settings: {
++      getDefaultProjectDir: unavailable('settings.getDefaultProjectDir'),
++      pickDefaultProjectDir: unavailable('settings.pickDefaultProjectDir'),
++      setDefaultProjectDir: unavailable('settings.setDefaultProjectDir')
++    },
++    revealLogs: unavailable('revealLogs'),
++    getRecentLogs: unavailable('getRecentLogs'),
++    readDir: unavailable('readDir'),
++    terminal: {
++      attach: unavailable('terminal.attach'),
++      cwd: unavailable('terminal.cwd'),
++      dispose: unavailable('terminal.dispose'),
++      onData: neverFires,
++      onExit: neverFires,
++      resize: unavailable('terminal.resize'),
++      start: unavailable('terminal.start'),
++      write: unavailable('terminal.write')
++    },
++    getBootstrapState: unavailable('getBootstrapState'),
++    continueBootstrapLocal: unavailable('continueBootstrapLocal'),
++    resetBootstrap: unavailable('resetBootstrap'),
++    repairBootstrap: unavailable('repairBootstrap'),
++    cancelBootstrap: unavailable('cancelBootstrap'),
++    getVersion: unavailable('getVersion'),
++    updates: {
++      check: unavailable('updates.check'),
++      apply: unavailable('updates.apply'),
++      getBranch: unavailable('updates.getBranch'),
++      setBranch: unavailable('updates.setBranch'),
++      onProgress: neverFires
++    },
++    uninstall: {
++      summary: unavailable('uninstall.summary'),
++      run: unavailable('uninstall.run')
++    },
++    themes: {
++      fetchMarketplace: unavailable('themes.fetchMarketplace'),
++      searchMarketplace: unavailable('themes.searchMarketplace')
++    },
++    findInPage: unavailable('findInPage'),
++    stopFindInPage: unavailable('stopFindInPage')
++  }
++}
+diff --git a/apps/desktop/src/main.tsx b/apps/desktop/src/main.tsx
+index e71435b83c..e82d8d9f87 100644
+--- a/apps/desktop/src/main.tsx
++++ b/apps/desktop/src/main.tsx
+@@ -1,3 +1,6 @@
++// Web-build only: installs the browser shim for `window.hermesDesktop` before
++// any module below can read it (dead-code-eliminated in the Electron build).
++import '@/lib/bridge/install'
+ import './styles.css'
+ // Side-effect: reports in-flight turns to the main process for the quit guard.
+ import './store/active-work'

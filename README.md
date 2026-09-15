@@ -2,7 +2,9 @@
 
 > Documentation home for the web/mobile build of the Hermes desktop app.
 > **Code lives on the fork branch:** `zswll2/hermes-agent` → `feat/desktop-web`
-> (this repo holds the write-up only, so the fork's `main` can keep tracking upstream).
+> (this repo holds the write-up plus an exportable patch series, so the fork's `main` can keep tracking upstream).
+
+**语言 / Language:** [English](README.md) · [**中文**](README.zh-CN.md)
 
 ---
 
@@ -124,6 +126,36 @@ already ships a responsive drawer"), and the desktop-web PR
 *"genuinely valuable and still absent from main … welcome as a standalone rebased PR"*). If you want
 that landed upstream, it's ~22 lines — `web/public/manifest.webmanifest` + 6 meta lines in
 `web/index.html` + 3 icons — and it needs **no** service worker under this build's reasoning.
+
+## Where the code lives
+
+| | |
+|---|---|
+| **Single source of truth** | fork branch `zswll2/hermes-agent` → `feat/desktop-web` (32 commits, base `ac0f4104c5`) |
+| **This repo** | the write-up, plus `patches/` (32 exported patches) and `scripts/apply-patches.sh` |
+
+One source of truth on purpose: the fork's `main` must stay a clean fast-forward of upstream, and a
+second copy of the source here would drift immediately.
+
+### Applying the patches
+
+```bash
+bash scripts/apply-patches.sh          # clones upstream, checks out the base, applies all patches
+```
+
+Manual equivalent:
+
+```bash
+git clone https://github.com/NousResearch/hermes-agent.git
+cd hermes-agent
+git checkout -b feat/desktop-web ac0f4104c55d9de19bbe8ac431d2df97836d1865
+git am /path/to/patches/*.patch
+cd apps/desktop && npm ci && npm run build:web
+```
+
+> ⚠️ The patch base is `ac0f4104c5`; upstream `main` has moved 1,700+ commits since. Amending these
+> patches straight onto a fresh `main` **will conflict** (purely additive files usually apply; edits
+> to existing files do not). That is why cloning the branch is the recommended route.
 
 ## Known limitations
 

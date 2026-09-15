@@ -1,0 +1,64 @@
+From 01b00f70f667fd849151a258e4788f895b83c363 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 16:34:29 +0800
+Subject: [PATCH 23/32] fix(desktop): coarse-only bottom safe-area inset for
+ narrow drawers and page bodies
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phone drawers and the capability pages (skills/messaging/artifacts) scrolled
+their bottom rows flush to the viewport edge, colliding with the iPhone home
+indicator (env(safe-area-inset-bottom)) and leaving no thumb room — the skills
+bottom row measured 47px from the screen edge at 390x844. Add a coarse-only
+padding-bottom: calc(var(--safe-bottom) + 12px) on [data-narrow-drawer] and a
+new [data-page-body] marker on PageSearchShell's scrollport. Fine-pointer
+computed styles are untouched, so desktop layout is byte-identical.
+---
+ apps/desktop/src/app/page-search-shell.tsx |  7 ++++++-
+ apps/desktop/src/styles.css                | 14 ++++++++++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/apps/desktop/src/app/page-search-shell.tsx b/apps/desktop/src/app/page-search-shell.tsx
+index 1219a64ba5..07a1dddea3 100644
+--- a/apps/desktop/src/app/page-search-shell.tsx
++++ b/apps/desktop/src/app/page-search-shell.tsx
+@@ -115,7 +115,12 @@ export function PageSearchShell({
+         )}
+         {filters ? <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2">{filters}</div> : null}
+       </div>
+-      <div className="min-h-0 flex-1 overflow-hidden bg-(--ui-chat-surface-background)">{children}</div>
++      {/* data-page-body: hooks the coarse-pointer bottom safe-area inset in
++          styles.css — this is the scrollport whose last rows run flush to the
++          viewport bottom on phones (home indicator collision). */}
++      <div className="min-h-0 flex-1 overflow-hidden bg-(--ui-chat-surface-background)" data-page-body="">
++        {children}
++      </div>
+     </section>
+   )
+ }
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index 3aa6af5a1a..84bb39fb39 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3631,6 +3631,20 @@ button,
+   animation: narrow-drawer-in-right 160ms ease-out;
+ }
+ 
++/* Touch bottom inset for the drawers and full-page capability surfaces
++   (skills/messaging/artifacts): their scrollable rows otherwise run flush to
++   the viewport bottom, colliding with the iPhone home indicator
++   (env(safe-area-inset-bottom) ≈ 34px) and leaving no thumb room. Coarse
++   pointers ONLY — the top inset above is a different concern (notch) handled
++   by the shell root; on fine pointers every computed style stays exactly as
++   before, so desktop layout is untouched. */
++@media (pointer: coarse) {
++  [data-narrow-drawer],
++  [data-page-body] {
++    padding-bottom: calc(var(--safe-bottom, 0px) + 12px);
++  }
++}
++
+ @keyframes narrow-drawer-in-left {
+   from {
+     opacity: 0.6;

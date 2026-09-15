@@ -1,0 +1,121 @@
+From 3b643f16ed6f76e2c63fabb84e169fe1af962470 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 21:22:52 +0800
+Subject: [PATCH 31/32] fix(desktop): coarse titlebar band centers on the 44px
+ touch clusters
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Band height H = 2·(t+22) = 54px (measured --titlebar-controls-top t=5), so
+the band's center equals the fixed clusters' button centers instead of
+riding 10px above them and letting the buttons overflow the band by 15px.
+The four cluster-clearance values riding the old 34px arithmetic
+(--chat-top-gap, zone strip, drawer strip, drawer close) are re-derived in
+lockstep (cluster bottom 49 + 8 - band 54 = 3px), keeping the first tab
+row, first bubble, and drawer strip at their exact previous positions.
+Band carries a stable data-slot=titlebar-band audit anchor. Fine pointers
+keep the 34px band and 24px buttons, pixel-identical.
+---
+ apps/desktop/src/app/contrib/controller.tsx |  2 +-
+ apps/desktop/src/styles.css                 | 40 +++++++++++++--------
+ 2 files changed, 27 insertions(+), 15 deletions(-)
+
+diff --git a/apps/desktop/src/app/contrib/controller.tsx b/apps/desktop/src/app/contrib/controller.tsx
+index 7d2c8eda4e..8c19f4447a 100644
+--- a/apps/desktop/src/app/contrib/controller.tsx
++++ b/apps/desktop/src/app/contrib/controller.tsx
+@@ -886,7 +886,7 @@ export function ContribController() {
+                   tree-published --workspace-left/right vars (pure CSS, no rect
+                   threading), clamped to clear the REAL TitlebarControls
+                   clusters (fixed, z-70); center is truly window-centered. */}
+-          <div className="relative flex h-[34px] shrink-0 items-center bg-(--ui-sidebar-surface-background) text-xs">
++          <div className="relative flex h-[34px] shrink-0 items-center bg-(--ui-sidebar-surface-background) text-xs" data-slot="titlebar-band">
+             {/* Drag strips, AppShell-style: cut to AVOID the fixed control
+                 clusters instead of overlapping them — Electron's no-drag
+                 carve-out of fixed/transformed elements is unreliable, so a
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index 5008f4f923..11d218b4a4 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3549,14 +3549,14 @@ html:has([data-hud-shell]) [data-slot='popover-content'] {
+   /* Coarse pointers add this much clearance below the in-flow titlebar for
+      the transcript's first bubble (thread/list.tsx top pad). Same arithmetic
+      as the zone-strip margin below (cluster bottom 49 + 8 breathing room −
+-     titlebar band 34) so the first message clears the toolbar exactly like
++     titlebar band 54) so the first message clears the toolbar exactly like
+      the first tab row. Fine pointers keep 0 — pixel-neutral. */
+   --chat-top-gap: 0px;
+ }
+ 
+ @media (pointer: coarse) {
+   :root {
+-    --chat-top-gap: 23px;
++    --chat-top-gap: 3px;
+   }
+ }
+ 
+@@ -3714,6 +3714,19 @@ button,
+    The glyph stays at its designed size — only the hit area grows. Coarse
+    pointers only, so mouse-driven titlebars keep their tight 24px rhythm. */
+ @media (pointer: coarse) {
++  /* Titlebar band height: the band's center must equal the fixed clusters'
++   button centers. Button box y = band.top + t and is 44px tall, so the band
++   needs H = 2·(t + 22); with the measured --titlebar-controls-top t=5
++   (wiring.tsx measures it at runtime) that is 54px. Height-only — the band
++   already sits on the shell's safe-top padding, so padding here would
++   double-count the inset (see the calc-top comment above). LOCKSTEP: the
++   four cluster-clearance values below (--chat-top-gap in :root, zone strip,
++   drawer strip, drawer close) are re-derived from this height as
++   cluster bottom 49 + 8 − band bottom; change H and re-derive all four. */
++  [data-slot='titlebar-band'] {
++    height: 54px;
++  }
++
+   [data-slot='titlebar-chrome'] [data-slot='tooltip-trigger'] {
+     min-height: 44px;
+     min-width: 44px;
+@@ -3726,16 +3739,15 @@ button,
+     min-height: 44px;
+   }
+ 
+-  /* Toolbar↔tab clearance: coarse clusters occupy y 5..49 (top 5 + 44px
+-     targets) while zone tab strips start right below the 34px in-flow
+-     titlebar band — a 15px overlap band that safe-area shifts move in
+-     lockstep (padding + calc add the SAME var), so the overlap itself must
+-     close here. 23px = cluster bottom 49 + 8px breathing room − band 34.
+-     The strip also grows to a 44px touch row (labels truncate) so its own
+-     trailing controls reach touch size without overlapping the tabs.
+-     Fine pointers: no margin, pixel-identical to before. */
++  /* Toolbar↔tab clearance, in lockstep with the band height above: coarse
++     clusters occupy y 5..49 (top 5 + 44px targets) and the 54px band fully
++     contains them, leaving 3px = cluster bottom 49 + 8px breathing room −
++     band 54 before the first tab row. The strip also grows to a 44px touch
++     row (labels truncate) so its own trailing controls reach touch size
++     without overlapping the tabs. Fine pointers: no margin, pixel-identical
++     to before. */
+   [data-zone-tabstrip] {
+-    margin-top: 23px;
++    margin-top: 3px;
+     min-height: 44px;
+   }
+ 
+@@ -3744,15 +3756,15 @@ button,
+      the drag-drop stacking key and the drawer must stay out of drag
+      hit-testing). Change band/touch sizes in lockstep with the rule above. */
+   [data-narrow-drawer-strip] {
+-    margin-top: 23px;
++    margin-top: 3px;
+     min-height: 44px;
+   }
+ 
+   /* …and the drawer close button rides the same displacement: flush with
+-     the strip band (same 23px) so it clears the toolbar clusters by the
++     the strip band (same 3px) so it clears the toolbar clusters by the
+      same 8px. Tabs live at the strip's left; the button at the drawer's
+      right — no hit-rect contact. Fine pointers never render it. */
+   [data-narrow-drawer-close] {
+-    top: 23px;
++    top: 3px;
+   }
+ }

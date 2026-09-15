@@ -1,0 +1,147 @@
+From 60dc1b294fe0ead0ce4a633dfa52511d16ca8ce8 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 17:52:15 +0800
+Subject: [PATCH 16/32] test(desktop): pin the web-update reload contract (once
+ per stamp, guard first)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+D2's diagnosis held: checkOnce already reloads exactly once per remote
+stamp (r4 evidence was a framenavigated counting artifact), so the entire
+deliverable is the missing behavior contract. The ui vitest project gets
+explicit __HERMES_WEB__/__HERMES_BUILD_STAMP__ defines — the inherited
+ones derive from build mode and the untracked public/build-stamp.json
+('' on a fresh checkout), and vi.stubGlobal cannot reach transform-time
+defines. Zero product-code change.
+---
+ apps/desktop/src/lib/web-update.test.ts | 99 +++++++++++++++++++++++++
+ apps/desktop/vitest.config.ts           |  9 +++
+ 2 files changed, 108 insertions(+)
+ create mode 100644 apps/desktop/src/lib/web-update.test.ts
+
+diff --git a/apps/desktop/src/lib/web-update.test.ts b/apps/desktop/src/lib/web-update.test.ts
+new file mode 100644
+index 0000000000..1f221690e6
+--- /dev/null
++++ b/apps/desktop/src/lib/web-update.test.ts
+@@ -0,0 +1,99 @@
++/** Behavior contract for the web PWA update check (src/lib/web-update.ts):
++ * one auto-reload per remote stamp, guard written BEFORE the reload, a manual
++ * pill once the guard has fired, and silence when the remote matches the
++ * embedded stamp or the probe fails. The embedded stamp comes from the
++ * ui-project define in vitest.config.ts ('vitest-embedded-stamp'). */
++import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
++import { installWebUpdateCheck, WEB_STAMP_STORAGE_KEY } from './web-update'
++
++const EMBEDDED = 'vitest-embedded-stamp'
++
++const okStamp = (buildId: string) => () =>
++  Promise.resolve({ ok: true, json: () => Promise.resolve({ buildId }) } as Response)
++
++const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0))
++
++let fetchMock: Mock
++let reloadSpy: Mock
++let setItemSpy: ReturnType<typeof vi.spyOn>
++
++const pill = () => document.querySelector('[data-web-update-pill]')
++
++beforeEach(() => {
++  sessionStorage.clear()
++  pill()?.remove()
++  fetchMock = vi.fn()
++  vi.stubGlobal('fetch', fetchMock)
++  reloadSpy = vi.fn()
++  Object.defineProperty(window, 'location', {
++    value: { reload: reloadSpy },
++    configurable: true,
++    writable: true,
++  })
++  // jsdom hands out a fresh Storage proxy per window.sessionStorage access,
++  // so the spy must live on the shared prototype to see the product call.
++  setItemSpy = vi.spyOn(Storage.prototype, 'setItem')
++})
++
++afterEach(() => {
++  vi.unstubAllGlobals()
++  vi.restoreAllMocks()
++  pill()?.remove()
++  sessionStorage.clear()
++})
++
++describe('web-update checkOnce contract (via installWebUpdateCheck)', () => {
++  it('first mismatch reloads exactly once and writes the guard BEFORE reloading', async () => {
++    fetchMock.mockImplementation(okStamp('remote-new'))
++    installWebUpdateCheck()
++    await flush()
++
++    expect(reloadSpy).toHaveBeenCalledTimes(1)
++    expect(sessionStorage.getItem(WEB_STAMP_STORAGE_KEY)).toBe('remote-new')
++    // Order proof: the guard must already be in place when reload fires, or a
++    // stale page reloading would loop forever.
++    expect(setItemSpy.mock.invocationCallOrder[0]).toBeLessThan(
++      reloadSpy.mock.invocationCallOrder[0]
++    )
++
++    // Resumes (visibilitychange→visible) must not reload a second time for
++    // the same remote stamp — jsdom's visibilityState is 'visible' by default.
++    for (let i = 0; i < 5; i++) {
++      document.dispatchEvent(new Event('visibilitychange'))
++      await flush()
++    }
++
++    expect(reloadSpy).toHaveBeenCalledTimes(1)
++    expect(pill()).not.toBeNull()
++  })
++
++  it('guard already hit → pill only, no reload', async () => {
++    sessionStorage.setItem(WEB_STAMP_STORAGE_KEY, 'remote-new')
++    fetchMock.mockImplementation(okStamp('remote-new'))
++    installWebUpdateCheck()
++    await flush()
++
++    expect(reloadSpy).not.toHaveBeenCalled()
++    expect(pill()).not.toBeNull()
++  })
++
++  it('remote equals embedded → no action', async () => {
++    fetchMock.mockImplementation(okStamp(EMBEDDED))
++    installWebUpdateCheck()
++    await flush()
++
++    expect(reloadSpy).not.toHaveBeenCalled()
++    expect(pill()).toBeNull()
++    expect(sessionStorage.getItem(WEB_STAMP_STORAGE_KEY)).toBeNull()
++  })
++
++  it('fetch rejects → no action', async () => {
++    fetchMock.mockImplementation(() => Promise.reject(new Error('offline')))
++    installWebUpdateCheck()
++    await flush()
++
++    expect(reloadSpy).not.toHaveBeenCalled()
++    expect(pill()).toBeNull()
++    expect(sessionStorage.getItem(WEB_STAMP_STORAGE_KEY)).toBeNull()
++  })
++})
+diff --git a/apps/desktop/vitest.config.ts b/apps/desktop/vitest.config.ts
+index b76230ff0b..809944b7da 100644
+--- a/apps/desktop/vitest.config.ts
++++ b/apps/desktop/vitest.config.ts
+@@ -3,6 +3,15 @@ import { defineConfig } from 'vitest/config'
+ 
+ const reactUi: TestProjectConfiguration = {
+   extends: './vite.config.ts',
++  // Explicit defines for the ui project: the extended vite.config.ts derives
++  // __HERMES_BUILD_STAMP__ from the UNTRACKED public/build-stamp.json ('' on a
++  // fresh checkout) and __HERMES_WEB__ from build mode — both wrong for tests
++  // exercising the web-update contract (src/lib/web-update.test.ts). vi.stubGlobal
++  // cannot reach transform-time defines; they must be set here.
++  define: {
++    __HERMES_WEB__: 'true',
++    __HERMES_BUILD_STAMP__: '"vitest-embedded-stamp"'
++  },
+   test: {
+     name: 'ui',
+     environment: 'jsdom',

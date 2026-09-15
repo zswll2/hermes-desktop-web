@@ -1,0 +1,203 @@
+From 15fe7b084c9c61337ae14db18838d9867e4ae670 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 23:22:46 +0800
+Subject: [PATCH 27/32] fix(desktop): suspend top-center toasts and statusbar
+ during coarse narrow reveals
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Q1.A: the top-center notification banner (fixed, over-modal) painted over a
+revealed narrow drawer's first rows on phones. Suspend the stack for the
+reveal's lifetime — the store (counts, dismiss timers) is untouched, so the
+banner returns exactly as it was when the drawer closes.
+
+Q1.B: the in-flow statusbar and the drawer fought over the bottom edge while
+revealed. Unmount the statusbar for the reveal's lifetime (same unmount
+semantics as the toggle-off path) and align the composer dock to the new
+shared --drawer-bottom-align variable so the drawer's last row and the dock
+share one baseline. Both gated on coarse pointer + active reveal; fine
+pointers and reveal-inactive coarse layouts are pixel-identical.
+---
+ apps/desktop/src/app/contrib/controller.tsx     | 16 ++++++++++++++--
+ apps/desktop/src/components/notifications.tsx   | 12 +++++++++++-
+ .../tree/renderer/narrow-overlays.tsx           | 10 +++++++++-
+ .../src/components/pane-shell/tree/store.ts     |  7 +++++++
+ apps/desktop/src/styles.css                     | 17 ++++++++++++++++-
+ 5 files changed, 57 insertions(+), 5 deletions(-)
+
+diff --git a/apps/desktop/src/app/contrib/controller.tsx b/apps/desktop/src/app/contrib/controller.tsx
+index a1fa39755b..7d2c8eda4e 100644
+--- a/apps/desktop/src/app/contrib/controller.tsx
++++ b/apps/desktop/src/app/contrib/controller.tsx
+@@ -21,6 +21,7 @@ import {
+   isPaneVisible,
+   markCollapsePane,
+   mirrorLayoutTree,
++  $narrowRevealActive,
+   paneRootSide,
+   registerLayoutResetHandler,
+   registerPaneCloser,
+@@ -41,6 +42,7 @@ import { Slot } from '@/contrib/react/slot'
+ import { useContributions } from '@/contrib/react/use-contributions'
+ import { registry } from '@/contrib/registry'
+ import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
++import { useMediaQuery } from '@/hooks/use-media-query'
+ import { translateNow } from '@/i18n'
+ import { NEW_SESSION_TITLE, sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
+ import { Download, FileText, LayoutDashboard, PanelBottom, PanelTop, Terminal, Upload, Zap } from '@/lib/icons'
+@@ -823,6 +825,14 @@ function TitlebarSlot({ area, className, style }: TitlebarSlotProps) {
+ export function ContribController() {
+   const sidebarOpen = useStore($sidebarOpen)
+   const statusbarVisible = useStore($statusbarVisible)
++  const narrowReveal = useStore($narrowRevealActive)
++  const coarse = useMediaQuery('(pointer: coarse)')
++
++  // A coarse reveal makes the in-flow statusbar fight the drawer for the
++  // bottom edge: unmount it for the reveal's lifetime (same unmount semantics
++  // as the toggle-off path) and let the data-narrow-reveal stamp align the
++  // composer dock with the drawer's content inset (styles.css).
++  const suspendStatusbar = narrowReveal && coarse
+ 
+   // HUD mode is the SAME app with its frame removed: the wiring (gateway,
+   // sessions, streams, submit) mounts identically, and only the shell around
+@@ -856,6 +866,7 @@ export function ContribController() {
+         <AppContextMenu />
+         <div
+           className="flex h-screen min-h-0 w-screen flex-col bg-(--ui-bg-chrome) text-(--ui-text-primary)"
++          data-narrow-reveal={narrowReveal ? '' : undefined}
+           // Window-glass hook: this div and the sidebar-wrapper above it are
+           // the app shell's two full-window opaque painters; the
+           // [data-hermes-glass] rules in styles.css clear them so the tint
+@@ -922,8 +933,9 @@ export function ContribController() {
+           {/* The REAL statusbar (model pill, command center, agents, …) with
+               statusBar.left/right contributions merged in. Unmounted — not
+               just hidden — while toggled off, so its 15s status poll and the
+-              per-turn readouts stop with it. */}
+-          {statusbarVisible && <WiredPane part="statusbar" />}
++              per-turn readouts stop with it. Also unmounted for the duration
++              of a coarse-pointer narrow reveal (see suspendStatusbar). */}
++          {statusbarVisible && !suspendStatusbar && <WiredPane part="statusbar" />}
+         </div>
+       </ContribWiring>
+     </SidebarProvider>
+diff --git a/apps/desktop/src/components/notifications.tsx b/apps/desktop/src/components/notifications.tsx
+index 60d91a2c01..6a55c75c77 100644
+--- a/apps/desktop/src/components/notifications.tsx
++++ b/apps/desktop/src/components/notifications.tsx
+@@ -6,6 +6,8 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+ import { Button } from '@/components/ui/button'
+ import { Codicon } from '@/components/ui/codicon'
+ import { CopyButton } from '@/components/ui/copy-button'
++import { $narrowRevealActive } from '@/components/pane-shell/tree/store'
++import { useMediaQuery } from '@/hooks/use-media-query'
+ import { useI18n } from '@/i18n'
+ import { triggerHaptic } from '@/lib/haptics'
+ import { AlertCircle, AlertTriangle, CheckCircle2, type IconComponent, Info } from '@/lib/icons'
+@@ -51,6 +53,8 @@ export function NotificationStack() {
+   const lastNotificationIdRef = useRef<string | null>(null)
+   const [expanded, setExpanded] = useState(false)
+   const copy = t.notifications
++  const coarse = useMediaQuery('(pointer: coarse)')
++  const narrowReveal = useStore($narrowRevealActive)
+ 
+   useEffect(() => {
+     if (defaultStack.length <= 1) {
+@@ -77,9 +81,15 @@ export function NotificationStack() {
+     }
+   }, [notifications])
+ 
++  // The top-center banner is fixed above the over-modal rung, so on a phone it
++  // paints over a revealed narrow drawer's first rows. Suspend it for the
++  // reveal's lifetime instead: the store (counts, dismiss timers) is untouched,
++  // and closing the drawer brings the banner back exactly as it was.
++  const topCenterSuspended = coarse && narrowReveal
++
+   return (
+     <>
+-      {defaultStack.length > 0 && (
++      {defaultStack.length > 0 && !topCenterSuspended && (
+         <TopCenterStack
+           copy={copy}
+           expanded={expanded}
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+index 5b19879c2b..a7ab1c1ade 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+@@ -24,7 +24,7 @@ import { cn } from '@/lib/utils'
+ 
+ import { PANE_TOGGLE_REVEAL_EVENT } from '../..'
+ import { allPaneIds, findGroupOfPane } from '../model'
+-import { $hiddenTreePanes, $layoutTree, $narrowViewport, revealTreePane } from '../store'
++import { $hiddenTreePanes, $layoutTree, $narrowRevealActive, $narrowViewport, revealTreePane } from '../store'
+ 
+ import { paneChrome } from './track-model'
+ 
+@@ -46,6 +46,14 @@ export function NarrowOverlays() {
+   const revealActive = reveal !== null
+   useEffect(() => (revealActive ? pushEscapeLayer(ESCAPE_PRIORITY.narrowOverlay) : undefined), [revealActive])
+ 
++  // Cleanup matters: leaving the DOM with a reveal still open (tree → null)
++  // must not strand a stale `true` for outside-tree chrome.
++  useEffect(() => {
++    $narrowRevealActive.set(revealActive)
++
++    return () => $narrowRevealActive.set(false)
++  }, [revealActive])
++
+   const inTree = useMemo(() => new Set(tree ? allPaneIds(tree) : []), [tree])
+ 
+   const collapsibles = useMemo(
+diff --git a/apps/desktop/src/components/pane-shell/tree/store.ts b/apps/desktop/src/components/pane-shell/tree/store.ts
+index f5cfad723a..7683782a8a 100644
+--- a/apps/desktop/src/components/pane-shell/tree/store.ts
++++ b/apps/desktop/src/components/pane-shell/tree/store.ts
+@@ -1134,6 +1134,13 @@ export const $narrowViewport = atom(Boolean(narrowQuery?.matches))
+ 
+ narrowQuery?.addEventListener('change', event => $narrowViewport.set(event.matches))
+ 
++/**
++ * NarrowOverlays' reveal state mirrored for chrome outside the tree (top-center
++ * toasts, statusbar): consumers gate on this AND `(pointer: coarse)`, so fine
++ * pointers never change behavior.
++ */
++export const $narrowRevealActive = atom(false)
++
+ /** The titlebar flip toggle (⌘\): mirror the whole layout left↔right. */
+ export function mirrorLayoutTree() {
+   const tree = $layoutTree.get()
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index 84bb39fb39..d0d37a9408 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3539,6 +3539,13 @@ html:has([data-hud-shell]) [data-slot='popover-content'] {
+   --safe-top: env(safe-area-inset-top, 0px);
+   --safe-bottom: env(safe-area-inset-bottom, 0px);
+   --keyboard-inset: 0px;
++  /* The single bottom-baseline alignment value for touch: what coarse drawers
++     ([data-narrow-drawer]) and full-page bodies pad their scroll content by,
++     AND what the composer dock lifts itself by while a narrow reveal is
++     active (see the reveal rule below) — so the drawer's last row and the
++     dock's bottom edge share one baseline instead of two. Fine pointers and
++     reveal-inactive coarse layouts compute nothing from it. */
++  --drawer-bottom-align: calc(var(--safe-bottom, 0px) + 12px);
+   /* Coarse pointers add this much clearance below the in-flow titlebar for
+      the transcript's first bubble (thread/list.tsx top pad). Same arithmetic
+      as the zone-strip margin below (cluster bottom 49 + 8 breathing room −
+@@ -3641,7 +3648,15 @@ button,
+ @media (pointer: coarse) {
+   [data-narrow-drawer],
+   [data-page-body] {
+-    padding-bottom: calc(var(--safe-bottom, 0px) + 12px);
++    padding-bottom: var(--drawer-bottom-align);
++  }
++
++  /* While a narrow drawer reveal is active, the dock adopts the SAME bottom
++     baseline the drawer's content is inset by, so the drawer's last row and
++     the dock's bottom edge stop fighting over the bottom edge. Scoped to the
++     reveal: coarse layouts without an open drawer are pixel-identical. */
++  [data-narrow-reveal] [data-slot='composer-dock']:not([data-popped-out]) {
++    bottom: var(--drawer-bottom-align);
+   }
+ }
+ 

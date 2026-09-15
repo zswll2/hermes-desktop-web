@@ -1,0 +1,424 @@
+From 48c3dd77e791c8220a4589599bd80c4c1462e697 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 16:07:09 +0800
+Subject: [PATCH 11/32] feat(desktop): web build-stamp self-compare with resume
+ auto-reload
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+F4d: write-build-stamp.mjs also emits public/build-stamp.json (buildId =
+commit+builtAt); vite's publicDir copies it into dist-web after the
+emptyOutDir wipe and the same file feeds the __HERMES_BUILD_STAMP__ define,
+so the embedded constant and the served stamp compare equal by
+construction. Electron builds copy the file into dist/ inertly.
+
+User addendum B: the web build re-fetches ${BASE_URL}build-stamp.json
+(relative — resolves under /app/, never the dashboard catch-all) on load
+AND on visibilitychange->visible, because a home-screen WKWebView resumes
+without navigation so HTML cache headers never run. A mismatch
+auto-reloads ONCE per remote stamp (sessionStorage guard against loops)
+and falls back to a manual translated update pill when the reload already
+happened. No-op in the Electron build.
+---
+ apps/desktop/scripts/write-build-stamp.mjs |  13 +-
+ apps/desktop/src/i18n/ar.ts                |   4 +
+ apps/desktop/src/i18n/en.ts                |   4 +
+ apps/desktop/src/i18n/ja.ts                |   4 +
+ apps/desktop/src/i18n/ru.ts                |   4 +
+ apps/desktop/src/i18n/types.ts             |   4 +
+ apps/desktop/src/i18n/zh-hant.ts           |   4 +
+ apps/desktop/src/i18n/zh.ts                |   4 +
+ apps/desktop/src/lib/web-update.ts         | 141 +++++++++++++++++++++
+ apps/desktop/src/main.tsx                  |  21 ++-
+ apps/desktop/src/vite-env.d.ts             |   5 +
+ apps/desktop/vite.config.ts                |  23 +++-
+ 12 files changed, 227 insertions(+), 4 deletions(-)
+ create mode 100644 apps/desktop/src/lib/web-update.ts
+
+diff --git a/apps/desktop/scripts/write-build-stamp.mjs b/apps/desktop/scripts/write-build-stamp.mjs
+index 076d5a893e..64dd04a302 100644
+--- a/apps/desktop/scripts/write-build-stamp.mjs
++++ b/apps/desktop/scripts/write-build-stamp.mjs
+@@ -159,7 +159,18 @@ function main() {
+   }
+ 
+   mkdirSync(OUT_DIR, { recursive: true })
+-  writeFileSync(OUT_FILE, JSON.stringify(payload, null, 2) + "\n", "utf8")
++  writeFileSync(OUT_FILE, JSON.stringify(payload, null, 2) + "\n", "utf-8")
++
++  // Web side of the stamp: vite's publicDir copies this file into outDir
++  // AFTER the (default) emptyOutDir wipe, so it survives every build; vite
++  // also reads it to embed __HERMES_BUILD_STAMP__ (vite.config.ts) — the
++  // file and the define must come from THIS one write to compare equal.
++  // Electron builds copy it into dist/ too (inert there, no consumer).
++  const webPayload = { ...payload, buildId: `${payload.commit}+${payload.builtAt}` }
++  const WEB_DIR = join(DESKTOP_ROOT, "public")
++  const WEB_FILE = join(WEB_DIR, "build-stamp.json")
++  mkdirSync(WEB_DIR, { recursive: true })
++  writeFileSync(WEB_FILE, JSON.stringify(webPayload, null, 2) + "\n", "utf-8")
+   console.log(
+     "[write-build-stamp] wrote " +
+       relative(REPO_ROOT, OUT_FILE) +
+diff --git a/apps/desktop/src/i18n/ar.ts b/apps/desktop/src/i18n/ar.ts
+index 06e0fe375b..337422630e 100644
+--- a/apps/desktop/src/i18n/ar.ts
++++ b/apps/desktop/src/i18n/ar.ts
+@@ -3048,6 +3048,10 @@ export const ar = defineLocale({
+       title: 'الشريط الجانبي',
+       description: 'تنقل التطبيق',
+       toggle: open => `${open ? 'إظهار' : 'إخفاء'} الشريط الجانبي`
++    },
++    webUpdate: {
++      available: 'يتوفر إصدار جديد',
++      refresh: 'اضغط للتحديث'
+     }
+   }
+ })
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index f1f239a4c3..04c8ab79bd 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -3850,6 +3850,10 @@ export const en: Translations = {
+       title: 'Sidebar',
+       description: 'Displays the mobile sidebar.',
+       toggle: open => `${open ? 'Show' : 'Hide'} sidebar`
++    },
++    webUpdate: {
++      available: 'A new version is available',
++      refresh: 'Tap to refresh'
+     }
+   }
+ }
+diff --git a/apps/desktop/src/i18n/ja.ts b/apps/desktop/src/i18n/ja.ts
+index 0f2b128480..c534e06156 100644
+--- a/apps/desktop/src/i18n/ja.ts
++++ b/apps/desktop/src/i18n/ja.ts
+@@ -3444,6 +3444,10 @@ export const ja = defineLocale({
+       title: 'サイドバー',
+       description: 'モバイルサイドバーを表示します。',
+       toggle: open => `サイドバーを${open ? '表示' : '非表示'}`
++    },
++    webUpdate: {
++      available: '新しいバージョンがあります',
++      refresh: 'タップして更新'
+     }
+   }
+ })
+diff --git a/apps/desktop/src/i18n/ru.ts b/apps/desktop/src/i18n/ru.ts
+index bbeac02270..35a942a7c7 100644
+--- a/apps/desktop/src/i18n/ru.ts
++++ b/apps/desktop/src/i18n/ru.ts
+@@ -3792,6 +3792,10 @@ export const ru = defineLocale({
+       title: 'Боковая панель',
+       description: 'Показывает мобильную боковую панель.',
+       toggle: open => `${open ? 'Показать' : 'Скрыть'} боковую панель`
++    },
++    webUpdate: {
++      available: 'Доступна новая версия',
++      refresh: 'Нажмите, чтобы обновить'
+     }
+   }
+ })
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index 9370ef9668..405d873adf 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -3312,5 +3312,9 @@ export interface Translations {
+       description: string
+       toggle: (open: boolean) => string
+     }
++    webUpdate: {
++      available: string
++      refresh: string
++    }
+   }
+ }
+diff --git a/apps/desktop/src/i18n/zh-hant.ts b/apps/desktop/src/i18n/zh-hant.ts
+index 9581fbfb14..4fcb19de01 100644
+--- a/apps/desktop/src/i18n/zh-hant.ts
++++ b/apps/desktop/src/i18n/zh-hant.ts
+@@ -3305,6 +3305,10 @@ export const zhHant = defineLocale({
+       title: '側邊欄',
+       description: '顯示行動裝置側邊欄。',
+       toggle: open => `${open ? '顯示' : '隱藏'}側邊欄`
++    },
++    webUpdate: {
++      available: '有新版本',
++      refresh: '點此重新整理'
+     }
+   }
+ })
+diff --git a/apps/desktop/src/i18n/zh.ts b/apps/desktop/src/i18n/zh.ts
+index 6cb00e724b..51040f47d4 100644
+--- a/apps/desktop/src/i18n/zh.ts
++++ b/apps/desktop/src/i18n/zh.ts
+@@ -3978,6 +3978,10 @@ export const zh: Translations = {
+       title: '侧边栏',
+       description: '显示移动端侧边栏。',
+       toggle: open => `${open ? '显示' : '隐藏'}侧边栏`
++    },
++    webUpdate: {
++      available: '有新版本',
++      refresh: '点此刷新'
+     }
+   }
+ }
+diff --git a/apps/desktop/src/lib/web-update.ts b/apps/desktop/src/lib/web-update.ts
+new file mode 100644
+index 0000000000..6c24a6e4c8
+--- /dev/null
++++ b/apps/desktop/src/lib/web-update.ts
+@@ -0,0 +1,141 @@
++/**
++ * PWA update visibility (web build only): the bundle carries its build stamp
++ * (`__HERMES_BUILD_STAMP__`, written by scripts/write-build-stamp.mjs into
++ * public/build-stamp.json and the vite `define`); the page re-fetches that
++ * SAME file on load and on every visibilitychange→visible and compares.
++ *
++ * Why page-side polling: a home-screen web app is a long-lived WKWebView
++ * that iOS RESUMES without a new navigation, so HTML cache headers never get
++ * a chance — only code running inside the page can notice a redeploy.
++ *
++ * On mismatch it AUTO-RELOADS ONCE per remote stamp (sessionStorage guard —
++ * a stale CDN edge serving the old bundle after reload must not loop), and
++ * falls back to a manual "new version, tap to refresh" pill when a reload
++ * already happened for this stamp.
++ */
++
++export const WEB_STAMP_STORAGE_KEY = 'hermes.web.reloadedStamp'
++
++function stampUrl(): string {
++  return `${import.meta.env.BASE_URL}build-stamp.json?t=${Date.now()}`
++}
++
++function remoteBuildId(payload: unknown): string | null {
++  if (typeof payload !== 'object' || payload === null) {
++    return null
++  }
++
++  const id = (payload as { buildId?: unknown }).buildId
++
++  return typeof id === 'string' && id.length > 0 ? id : null
++}
++
++function alreadyReloaded(remote: string): boolean {
++  try {
++    return sessionStorage.getItem(WEB_STAMP_STORAGE_KEY) === remote
++  } catch {
++    return false
++  }
++}
++
++function markReloaded(remote: string): void {
++  try {
++    sessionStorage.setItem(WEB_STAMP_STORAGE_KEY, remote)
++  } catch {
++    // Private-mode quota refusal just loses loop protection; the banner
++    // fallback still gives the user a manual way out.
++  }
++}
++
++function showUpdatePill(): void {
++  if (document.querySelector('[data-web-update-pill]')) {
++    return
++  }
++
++  const pill = document.createElement('button')
++  pill.dataset.webUpdatePill = ''
++  pill.setAttribute('aria-live', 'polite')
++  pill.style.cssText = [
++    'position:fixed',
++    'left:50%',
++    'transform:translateX(-50%)',
++    'top:calc(env(safe-area-inset-top,0px) + 44px)',
++    'z-index:2147483647',
++    'padding:0.5rem 1rem',
++    'border-radius:9999px',
++    'border:1px solid rgba(255,255,255,0.2)',
++    'background:rgba(20,20,24,0.92)',
++    'color:#fff',
++    'font:600 12px/1.2 system-ui,sans-serif',
++    'box-shadow:0 4px 16px rgba(0,0,0,0.35)'
++  ].join(';')
++  pill.type = 'button'
++  pill.addEventListener('click', () => location.reload())
++
++  const text = window.__HERMES_WEB_UPDATE_COPY__
++  pill.textContent = typeof text === 'string' ? text : 'A new version is available — tap to refresh'
++  document.body.appendChild(pill)
++}
++
++async function checkOnce(embedded: string): Promise<void> {
++  let remote: string | null = null
++
++  try {
++    const response = await fetch(stampUrl(), { cache: 'no-store' })
++
++    if (response.ok) {
++      remote = remoteBuildId(await response.json())
++    }
++  } catch {
++    return
++  }
++
++  if (!remote || remote === embedded) {
++    return
++  }
++
++  if (alreadyReloaded(remote)) {
++    showUpdatePill()
++
++    return
++  }
++
++  markReloaded(remote)
++  location.reload()
++}
++
++/** Web build only (`__HERMES_WEB__`); a no-op everywhere else. i18n copy is
++ *  injected via {@link setWebUpdateCopy} by the React layer. */
++export function installWebUpdateCheck(): void {
++  if (!__HERMES_WEB__ || typeof window === 'undefined' || !__HERMES_BUILD_STAMP__) {
++    return
++  }
++
++  const embedded = __HERMES_BUILD_STAMP__
++
++  void checkOnce(embedded)
++
++  document.addEventListener('visibilitychange', () => {
++    if (document.visibilityState === 'visible') {
++      void checkOnce(embedded)
++    }
++  })
++}
++
++declare global {
++  interface Window {
++    __HERMES_WEB_UPDATE_COPY__?: string
++  }
++}
++
++/** The pill is rendered outside React (document.body, before providers); the
++ *  translated copy arrives through this setter once i18n is up. */
++export function setWebUpdateCopy(copy: string): void {
++  window.__HERMES_WEB_UPDATE_COPY__ = copy
++
++  const pill = document.querySelector<HTMLElement>('[data-web-update-pill]')
++
++  if (pill) {
++    pill.textContent = copy
++  }
++}
+diff --git a/apps/desktop/src/main.tsx b/apps/desktop/src/main.tsx
+index e82d8d9f87..679bd5f46e 100644
+--- a/apps/desktop/src/main.tsx
++++ b/apps/desktop/src/main.tsx
+@@ -19,7 +19,7 @@ import './store/user-bubble-transparency'
+ import '@/debug/dev-only'
+ 
+ import { QueryClientProvider } from '@tanstack/react-query'
+-import { StrictMode } from 'react'
++import { StrictMode, useEffect } from 'react'
+ import { createRoot } from 'react-dom/client'
+ import { HashRouter } from 'react-router'
+ 
+@@ -27,14 +27,18 @@ import App from './app'
+ import { RootErrorBoundary } from './components/error-boundary'
+ import { HapticsProvider } from './components/haptics-provider'
+ import { RootTooltipProvider } from './components/ui/tooltip'
+-import { I18nProvider } from './i18n'
++import { I18nProvider, useI18n } from './i18n'
+ import { installClipboardShim } from './lib/clipboard'
+ import { queryClient } from './lib/query-client'
+ import { installRendererAnimationPauseState } from './lib/renderer-loop-pause'
+ import { installSelectionCopyColorGuard } from './lib/selection-copy-colors'
++import { installWebUpdateCheck, setWebUpdateCopy } from './lib/web-update'
+ import { ThemeProvider } from './themes/context'
+ 
+ installClipboardShim()
++// Web-build only: build-stamp self-compare + resume auto-reload (no-op in
++// the Electron build via __HERMES_WEB__).
++installWebUpdateCheck()
+ // Chromium serializes selection copies (Cmd+C, right-click Copy) with the
+ // theme's computed colors inlined; without this guard a dark-theme selection
+ // pastes as near-white text into light-background targets.
+@@ -90,6 +94,9 @@ if (winParam === 'overlay') {
+                     Disabling transitions makes navigate() commit at default priority. */}
+                   <HashRouter useTransitions={false}>
+                     <App />
++                    {/* The web-update fallback pill renders outside React;
++                        this feeds it the translated copy once i18n is up. */}
++                    <WebUpdateCopy />
+                   </HashRouter>
+                 </RootTooltipProvider>
+               </HapticsProvider>
+@@ -100,3 +107,13 @@ if (winParam === 'overlay') {
+     </StrictMode>
+   )
+ }
++
++function WebUpdateCopy() {
++  const { t } = useI18n()
++
++  useEffect(() => {
++    setWebUpdateCopy(`${t.ui.webUpdate.available} · ${t.ui.webUpdate.refresh}`)
++  }, [t])
++
++  return null
++}
+diff --git a/apps/desktop/src/vite-env.d.ts b/apps/desktop/src/vite-env.d.ts
+index 6fa453eeb7..b48f767ab5 100644
+--- a/apps/desktop/src/vite-env.d.ts
++++ b/apps/desktop/src/vite-env.d.ts
+@@ -2,3 +2,8 @@
+ 
+ // Build-mode flag injected by vite `define` (both modes — see vite.config.ts).
+ declare const __HERMES_WEB__: boolean
++
++// This build's web stamp id (public/build-stamp.json `buildId`, written by
++// scripts/write-build-stamp.mjs before vite runs); empty when the stamp file
++// was absent, which disables the web update check.
++declare const __HERMES_BUILD_STAMP__: string
+diff --git a/apps/desktop/vite.config.ts b/apps/desktop/vite.config.ts
+index 54dffec62d..1e4771bbd1 100644
+--- a/apps/desktop/vite.config.ts
++++ b/apps/desktop/vite.config.ts
+@@ -28,6 +28,22 @@ const real = (p: string): string | null => {
+   }
+ }
+ 
++/** Embed the web build stamp (__HERMES_BUILD_STAMP__) from the file
++ *  scripts/write-build-stamp.mjs wrote (it runs first in both build chains).
++ *  Reading the FILE — not re-resolving git here — guarantees the embedded
++ *  constant and the served build-stamp.json compare equal. Empty string when
++ *  the file is absent (direct `vite build`), which disables the check. */
++function webBuildStampDefine(): string {
++  try {
++    const raw = fs.readFileSync(path.resolve(__dirname, 'public/build-stamp.json'), 'utf-8')
++    const id = JSON.parse(raw).buildId
++
++    return typeof id === 'string' && id.length > 0 ? JSON.stringify(id) : '""'
++  } catch {
++    return '""'
++  }
++}
++
+ const fsAllow = [
+   ...new Set(
+     [
+@@ -108,7 +124,12 @@ export default defineConfig(({ command, mode }) => ({
+   // the `'false'` replacement so the web-bridge install branch becomes `if (false)`
+   // and is dead-code-eliminated (a bare identifier would throw ReferenceError at
+   // module top-level in the packaged app).
+-  define: { __HERMES_WEB__: mode === 'web' ? 'true' : 'false' },
++  define: {
++    __HERMES_WEB__: mode === 'web' ? 'true' : 'false',
++    // Defined in BOTH modes (a bare identifier would throw in the Electron
++    // bundle); the web-update module gates on __HERMES_WEB__ itself.
++    __HERMES_BUILD_STAMP__: webBuildStampDefine()
++  },
+   plugins: [react(), babel({ presets: [compilerPreset()] }), tailwindcss(), emojibaseAssets()],
+   css: {
+     // Pin an explicit (empty) PostCSS config. Tailwind is handled entirely by

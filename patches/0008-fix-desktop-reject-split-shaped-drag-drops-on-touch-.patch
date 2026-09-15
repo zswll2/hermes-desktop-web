@@ -1,0 +1,621 @@
+From e445fd079052211eac047c313c86abaf72d6aed7 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 15:50:50 +0800
+Subject: [PATCH 08/32] fix(desktop): reject split-shaped drag drops on
+ touch/narrow + fold user splits
+
+F4a: coarse-pointer or <=640px viewports now refuse split-shaped drops on
+both drag paths (pane tabs via drag-session, sessions/tiles via
+session-drag); stack/center drops are unchanged and denial keeps the
+selection retryable. Drag-created splits persist SplitNode.origin:'user'
+(written only by the two drag commit paths); entering a narrow viewport
+folds user splits whose smaller column would fall below 280px by routing
+the dropped column's panes through their existing close paths. The layout
+reset gains a zone-menu row and 44px touch targets on the edit-bar card
+for narrow reachability.
+---
+ apps/desktop/src/app/chat/session-drag.ts     |   9 +-
+ .../src/components/pane-shell/tree/model.ts   |  47 ++++++--
+ .../pane-shell/tree/narrow-fold.test.ts       |  67 ++++++++++++
+ .../components/pane-shell/tree/narrow-fold.ts | 101 ++++++++++++++++++
+ .../pane-shell/tree/renderer/drag-session.ts  |  16 ++-
+ .../pane-shell/tree/renderer/edit-bar.tsx     |   3 +-
+ .../pane-shell/tree/renderer/index.tsx        |   4 +
+ .../pane-shell/tree/renderer/tree-group.tsx   |   7 ++
+ .../src/components/pane-shell/tree/store.ts   |  13 ++-
+ apps/desktop/src/lib/tab-split-policy.test.ts |  25 +++++
+ apps/desktop/src/lib/tab-split-policy.ts      |  41 +++++++
+ apps/desktop/src/store/session-states.ts      |   5 +-
+ apps/desktop/src/styles.css                   |   7 ++
+ 13 files changed, 326 insertions(+), 19 deletions(-)
+ create mode 100644 apps/desktop/src/components/pane-shell/tree/narrow-fold.test.ts
+ create mode 100644 apps/desktop/src/components/pane-shell/tree/narrow-fold.ts
+ create mode 100644 apps/desktop/src/lib/tab-split-policy.test.ts
+ create mode 100644 apps/desktop/src/lib/tab-split-policy.ts
+
+diff --git a/apps/desktop/src/app/chat/session-drag.ts b/apps/desktop/src/app/chat/session-drag.ts
+index ae610d0c55..96901ce919 100644
+--- a/apps/desktop/src/app/chat/session-drag.ts
++++ b/apps/desktop/src/app/chat/session-drag.ts
+@@ -39,6 +39,7 @@ import {
+ } from '@/components/pane-shell/tree/renderer/drag-session'
+ import { $treeDragging, type DropHint, revealTreePane, SESSION_TILE_DRAG } from '@/components/pane-shell/tree/store'
+ import type { EngineZone, ZoneRect } from '@/components/pane-shell/tree/zones-engine'
++import { tabSplitAllowedNow } from '@/lib/tab-split-policy'
+ import { openSessionTile, type TileDock } from '@/store/session-states'
+ 
+ import { requestComposerInsertRefs } from './composer/focus'
+@@ -176,7 +177,13 @@ export function startSessionDrag(
+ 
+     onCommit() {
+       if (split) {
+-        openSessionTile(payload.id, split.pos, split.anchor, split.before)
++        // Touch/narrow viewports reject split-shaped drops (same policy as
++        // pane-tab drags — see drag-session.ts); stack/center drops pass.
++        if (split.pos !== 'center' && !tabSplitAllowedNow()) {
++          return
++        }
++
++        openSessionTile(payload.id, split.pos, split.anchor, split.before, undefined, split.pos === 'center' ? undefined : 'user')
+         // A tile for this session may already exist (openSessionTile is
+         // idempotent — e.g. persisted from an earlier run): a drop must never
+         // feel dead, so front/unhide/un-dismiss it either way.
+diff --git a/apps/desktop/src/components/pane-shell/tree/model.ts b/apps/desktop/src/components/pane-shell/tree/model.ts
+index 5fce015b6c..94a2b8a9f4 100644
+--- a/apps/desktop/src/components/pane-shell/tree/model.ts
++++ b/apps/desktop/src/components/pane-shell/tree/model.ts
+@@ -36,6 +36,12 @@ export interface SplitNode {
+   children: LayoutNode[]
+   /** Parallel to children; relative flex weights. */
+   weights: number[]
++  /** 'user' marks a split a DRAG created (edge-pos drop from either drag
++   *  path). It persists with the tree and is the narrow-viewport fold's only
++   *  trigger: programmatic splits (default tree, presets, adoption/dock
++   *  healing) never carry it, and pre-existing unmarked splits are left
++   *  alone — the "restore single column" reset entry covers those. */
++  origin?: 'user'
+ }
+ 
+ export interface GroupNode {
+@@ -76,13 +82,15 @@ export const split = (
+   orientation: Orientation,
+   children: LayoutNode[],
+   weights?: number[],
+-  id?: string
++  id?: string,
++  origin?: 'user'
+ ): SplitNode => ({
+   type: 'split',
+   id: id ?? nodeId('s'),
+   orientation,
+   children,
+-  weights: weights ?? children.map(() => 1)
++  weights: weights ?? children.map(() => 1),
++  origin
+ })
+ 
+ // ---------------------------------------------------------------------------
+@@ -260,7 +268,11 @@ export function insertAtGroup(
+   /** Edge splits only: the [target zone, added pane] weight pair (default
+    *  even). Lets a re-opened tile take the share it held when it closed
+    *  instead of half the anchor zone. */
+-  edgeWeights?: readonly [number, number]
++  edgeWeights?: readonly [number, number],
++  /** Tags the created split `origin: 'user'` — set ONLY by the two drag
++   *  commit paths, so the narrow-viewport fold never touches programmatic
++   *  splits (presets, adoption, dock healing). */
++  origin?: 'user'
+ ): LayoutNode | null {
+   const walk = (n: LayoutNode): LayoutNode => {
+     if (n.type === 'group') {
+@@ -291,7 +303,13 @@ export function insertAtGroup(
+       const children = leading ? [added, n] : [n, added]
+       const [targetWeight, addedWeight] = edgeWeights ?? [1, 1]
+ 
+-      return split(orientation, children, leading ? [addedWeight, targetWeight] : [targetWeight, addedWeight])
++      return split(
++        orientation,
++        children,
++        leading ? [addedWeight, targetWeight] : [targetWeight, addedWeight],
++        undefined,
++        origin
++      )
+     }
+ 
+     return { ...n, children: n.children.map(walk) }
+@@ -330,7 +348,8 @@ function shapeSignature(node: LayoutNode): string {
+ export function movePane(
+   root: LayoutNode,
+   paneId: string,
+-  target: { groupId: string; pos: DropPosition; before?: null | string }
++  target: { groupId: string; pos: DropPosition; before?: null | string },
++  origin?: 'user'
+ ): LayoutNode {
+   const from = findGroupOfPane(root, paneId)
+ 
+@@ -350,7 +369,7 @@ export function movePane(
+     return root
+   }
+ 
+-  const next = insertAtGroup(without, target.groupId, paneId, target.pos, target.before) ?? root
++  const next = insertAtGroup(without, target.groupId, paneId, target.pos, target.before, undefined, undefined, origin) ?? root
+ 
+   return shapeSignature(next) === shapeSignature(root) ? root : next
+ }
+@@ -366,10 +385,11 @@ export function movePanes(
+   root: LayoutNode,
+   paneIds: readonly string[],
+   target: { groupId: string; pos: DropPosition; before?: null | string },
+-  activeId: string = paneIds[0] ?? ''
++  activeId: string = paneIds[0] ?? '',
++  origin?: 'user'
+ ): LayoutNode {
+   if (paneIds.length <= 1) {
+-    return paneIds.length === 1 ? movePane(root, paneIds[0], target) : root
++    return paneIds.length === 1 ? movePane(root, paneIds[0], target, origin) : root
+   }
+ 
+   let without: LayoutNode | null = root
+@@ -389,7 +409,16 @@ export function movePanes(
+   // Only the lead activates — `insertAtGroup(activate)` would otherwise front
+   // each follower in turn.
+   const lead = paneIds[0]
+-  let next: LayoutNode | null = insertAtGroup(without, target.groupId, lead, target.pos, target.before)
++  let next: LayoutNode | null = insertAtGroup(
++    without,
++    target.groupId,
++    lead,
++    target.pos,
++    target.before,
++    undefined,
++    undefined,
++    origin
++  )
+ 
+   for (let i = 1; next && i < paneIds.length; i++) {
+     const leadGroup = findGroupOfPane(next, lead)
+diff --git a/apps/desktop/src/components/pane-shell/tree/narrow-fold.test.ts b/apps/desktop/src/components/pane-shell/tree/narrow-fold.test.ts
+new file mode 100644
+index 0000000000..f9779e3e13
+--- /dev/null
++++ b/apps/desktop/src/components/pane-shell/tree/narrow-fold.test.ts
+@@ -0,0 +1,67 @@
++import { describe, expect, it } from 'vitest'
++
++import { collectNarrowUserSplitExits, NARROW_MIN_COLUMN_PX } from './narrow-fold'
++import { group, split } from './model'
++
++const g = (id: string) => group([id])
++
++describe('collectNarrowUserSplitExits', () => {
++  it('exits every pane of the smaller column of a user split at phone width', () => {
++    const tree = split('row', [g('workspace'), g('terminal')], [3, 1], 's1', 'user')
++
++    expect(collectNarrowUserSplitExits(tree, 390)).toEqual(['terminal'])
++  })
++
++  it('keeps the larger-weight column even when both are below the min width', () => {
++    const tree = split('row', [g('workspace'), g('terminal')], [1, 1], 's1', 'user')
++
++    expect(collectNarrowUserSplitExits(tree, 390)).toEqual(['terminal'])
++    expect(collectNarrowUserSplitExits(tree, 390)).not.toContain('workspace')
++  })
++
++  it('never exits the uncloseable workspace column', () => {
++    const tree = split('row', [g('terminal'), g('workspace')], [3, 1], 's1', 'user')
++
++    expect(collectNarrowUserSplitExits(tree, 390)).toEqual([])
++  })
++
++  it('leaves unmarked splits alone (programmatic or pre-marker history)', () => {
++    const tree = split('row', [g('workspace'), g('terminal')], [3, 1])
++
++    expect(collectNarrowUserSplitExits(tree, 390)).toEqual([])
++  })
++
++  it('leaves column-orientation user splits alone (full width, stacked)', () => {
++    const tree = split('column', [g('workspace'), g('terminal')], [1, 1], 's1', 'user')
++
++    expect(collectNarrowUserSplitExits(tree, 390)).toEqual([])
++  })
++
++  it('keeps a user split whose smaller column is still readable', () => {
++    const tree = split('row', [g('workspace'), g('terminal')], [1, 1], 's1', 'user')
++
++    expect(collectNarrowUserSplitExits(tree, 1280)).toEqual([])
++  })
++
++  it('respects the custom min-width boundary (smaller side share * width)', () => {
++    const tree = split('row', [g('workspace'), g('terminal')], [1, 1], 's1', 'user')
++
++    expect(collectNarrowUserSplitExits(tree, 559, NARROW_MIN_COLUMN_PX)).toEqual(['terminal'])
++    expect(collectNarrowUserSplitExits(tree, 560, NARROW_MIN_COLUMN_PX)).toEqual([])
++  })
++
++  it('recurses into the kept side for nested user splits', () => {
++    const nested = split('row', [g('workspace'), g('files')], [1, 1], 's-inner', 'user')
++    const tree = split('row', [nested, g('terminal')], [3, 1], 's-outer', 'user')
++
++    expect(collectNarrowUserSplitExits(tree, 390)).toEqual(['terminal', 'files'])
++  })
++
++  it('handles a single group tree', () => {
++    expect(collectNarrowUserSplitExits(g('workspace'), 390)).toEqual([])
++  })
++
++  it('handles null', () => {
++    expect(collectNarrowUserSplitExits(null, 390)).toEqual([])
++  })
++})
+diff --git a/apps/desktop/src/components/pane-shell/tree/narrow-fold.ts b/apps/desktop/src/components/pane-shell/tree/narrow-fold.ts
+new file mode 100644
+index 0000000000..ac97c543e3
+--- /dev/null
++++ b/apps/desktop/src/components/pane-shell/tree/narrow-fold.ts
+@@ -0,0 +1,101 @@
++/**
++ * Narrow-viewport exit for drag-created splits (`SplitNode.origin === 'user'`).
++ *
++ * On a phone-width viewport a persisted split renders as unreadable sliver
++ * columns, so entering narrow mode folds each user split whose smaller
++ * column would fall below {@link NARROW_MIN_COLUMN_PX}: the larger-weight
++ * column is kept and every pane in the dropped column exits through its
++ * EXISTING close path (`closeTreePane` — tool panels collapse to their rail
++ * via their store closer, tiles are dismissed, hide-only tabs hide), which
++ * keeps the owning stores truthful. Splits without the marker (default
++ * tree, presets, adoption/dock healing, trees persisted before the marker
++ * existed) are deliberately untouched — the layout reset entry is their
++ * way back. Column-orientation (stacked) splits keep full width and are
++ * left alone too.
++ */
++
++import { allPaneIds, type LayoutNode } from './model'
++import { closeTreePane, $layoutTree, $narrowViewport } from './store'
++
++/** Below this column width a narrow-viewport split reads as a sliver. */
++export const NARROW_MIN_COLUMN_PX = 280
++
++/** The uncloseable main pane — never chosen for exit. */
++const KEEP_PANE = 'workspace'
++
++function smallerSideIndex(weights: number[]): number {
++  const total = weights.reduce((sum, w) => sum + w, 0)
++
++  if (total <= 0 || weights.length !== 2) {
++    return -1
++  }
++
++  // Ties drop the LATER child, so a [main | other] pair keeps main.
++  return weights[1] / total <= weights[0] / total ? 1 : 0
++}
++
++/**
++ * Collect the pane ids that should EXIT when folding user splits for a
++ * `viewportWidth`-wide narrow viewport. Pure — unit-testable against hand
++ * built trees. Recurses into the KEPT side (a readable column may itself
++ * hold a nested user split that is no longer readable at this width) and
++ * into every child of non-folding splits.
++ */
++export function collectNarrowUserSplitExits(
++  node: LayoutNode | null,
++  viewportWidth: number,
++  minWidth: number = NARROW_MIN_COLUMN_PX
++): string[] {
++  if (!node || node.type !== 'split') {
++    return []
++  }
++
++  if (node.origin === 'user' && node.orientation === 'row') {
++    const drop = smallerSideIndex(node.weights)
++
++    if (drop >= 0) {
++      const total = node.weights.reduce((sum, w) => sum + w, 0)
++      const dropPx = (node.weights[drop] / total) * viewportWidth
++
++      if (dropPx < minWidth) {
++        const dropChild = node.children[drop]
++        const dropPanes = allPaneIds(dropChild)
++
++        if (dropPanes.includes(KEEP_PANE)) {
++          return node.children.flatMap(child => collectNarrowUserSplitExits(child, viewportWidth, minWidth))
++        }
++
++        const kept = collectNarrowUserSplitExits(node.children[1 - drop], viewportWidth, minWidth)
++
++        return [...dropPanes, ...kept]
++      }
++    }
++  }
++
++  return node.children.flatMap(child => collectNarrowUserSplitExits(child, viewportWidth, minWidth))
++}
++
++/** Fold user splits once for the current narrow viewport (idempotent —
++ *  after the first fold the tree holds no qualifying splits). */
++export function foldUserSplitsForNarrowViewport(): void {
++  const tree = $layoutTree.get()
++
++  if (!tree || typeof window === 'undefined') {
++    return
++  }
++
++  for (const paneId of collectNarrowUserSplitExits(tree, window.innerWidth)) {
++    closeTreePane(paneId)
++  }
++}
++
++/** Mount-once watcher: folds on every transition INTO narrow (nanostores
++ *  fires the handler with the current value on subscribe, so a phone-width
++ *  boot folds persisted splits immediately). */
++export function watchNarrowUserSplitFolding(): () => void {
++  return $narrowViewport.subscribe(narrow => {
++    if (narrow) {
++      foldUserSplitsForNarrowViewport()
++    }
++  })
++}
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/drag-session.ts b/apps/desktop/src/components/pane-shell/tree/renderer/drag-session.ts
+index 594ef3ed53..484a473708 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/drag-session.ts
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/drag-session.ts
+@@ -34,6 +34,7 @@ import { createDragGhost, type DragGhost } from '@/lib/drag-ghost'
+ import { ESCAPE_PRIORITY, pushEscapeLayer } from '@/lib/escape-layers'
+ import { guardGuestPointers } from '@/lib/guest-pointer-guard'
+ import { reorderCommitHaptic, reorderStepHaptic } from '@/lib/reorder'
++import { tabSplitAllowedNow } from '@/lib/tab-split-policy'
+ 
+ import type { DropPosition } from '../model'
+ import { $dropHint, $treeDragging, type DropHint, mergeTreeZones, moveTreePanes, reorderTreePanes } from '../store'
+@@ -587,10 +588,21 @@ export function startPaneDrag(
+           // strip = stack at the divider slot; center = join the stack;
+           // an edge = split the zone and land there. The whole selection
+           // rides — the pressed tab fronts at the destination.
++          const pos = hint.pos ?? 'center'
++
++          // Touch/narrow viewports reject split-shaped drops outright: a
++          // committed sliver column is unreadable and its edge targets
++          // overlap the drawer hover strips. Denial keeps the tab selection
++          // (retryable), same as a deny-area release.
++          if (pos !== 'center' && !tabSplitAllowedNow()) {
++            return
++          }
++
+           moveTreePanes(
+             moving,
+-            { groupId: hint.groupId, pos: hint.pos ?? 'center', before: hint.stack?.before },
+-            paneId
++            { groupId: hint.groupId, pos, before: hint.stack?.before },
++            paneId,
++            pos === 'center' ? undefined : 'user'
+           )
+           spendSelection()
+         }
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/edit-bar.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/edit-bar.tsx
+index 854229c8f8..7a39f35417 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/edit-bar.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/edit-bar.tsx
+@@ -72,6 +72,7 @@ export function TreeEditBar() {
+   return (
+     <div
+       className="absolute z-50 flex w-[26rem] max-w-[calc(100%-2rem)] flex-col rounded-xl border border-(--ui-stroke-secondary) bg-popover text-popover-foreground shadow-2xl [-webkit-app-region:no-drag]"
++      data-tree-edit-bar=""
+       ref={cardRef}
+       style={pos ? { left: pos.x, top: pos.y } : { left: '50%', top: '50%', transform: 'translate(-50%, -50%)' }}
+     >
+@@ -92,7 +93,7 @@ export function TreeEditBar() {
+           </p>
+         </div>
+         <div className="flex shrink-0 items-center gap-1.5" onPointerDown={e => e.stopPropagation()}>
+-          <Button onClick={resetLayoutTree} size="sm" variant="ghost">
++          <Button aria-label={t.zones.reset} data-tree-edit-reset="" onClick={resetLayoutTree} size="sm" variant="ghost">
+             {t.zones.reset}
+           </Button>
+           <Button onClick={() => $layoutEditMode.set(false)} size="sm" variant="outline">
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/index.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/index.tsx
+index 3145f563d3..f5b7867d2e 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/index.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/index.tsx
+@@ -25,6 +25,7 @@ import { type ReactNode, useEffect } from 'react'
+ 
+ import { useLayoutEditHotkey } from '../../edit-mode'
+ import { publishWorkspaceGeometry } from '../../geometry'
++import { watchNarrowUserSplitFolding } from '../narrow-fold'
+ import { $layoutTree, trackActiveTreeGroup } from '../store'
+ import { ZoneEditor } from '../zone-editor'
+ 
+@@ -43,6 +44,9 @@ export function LayoutTreeRoot({ children }: { children?: ReactNode }) {
+   // Publish --workspace-left/right so chrome (titlebar title) aligns to the
+   // main pane's geometry in plain CSS.
+   useEffect(publishWorkspaceGeometry, [])
++  // Entering a narrow viewport folds drag-created (origin:'user') splits
++  // whose small column would be an unreadable sliver there.
++  useEffect(watchNarrowUserSplitFolding, [])
+ 
+   if (!tree) {
+     return null
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
+index 234cbdfce7..2d29aaa2ec 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
+@@ -65,6 +65,7 @@ import {
+   NEW_SESSION_DRAG,
+   noteActiveTreeGroup,
+   reloadTreePane,
++  resetLayoutTree,
+   restoreTreePane,
+   SESSION_TILE_DRAG,
+   setStripTabHidden,
+@@ -205,6 +206,12 @@ function ZoneMenu({
+             label: minimized ? t.zones.restore : t.zones.minimize,
+             onSelect: () => setTreeGroupMinimized(nodeId, !minimized)
+           })}
++        <kit.Separator />
++        {renderActionItem(kit, {
++          icon: 'discard',
++          label: t.zones.reset,
++          onSelect: () => resetLayoutTree()
++        })}
+       </>
+     )
+   }
+diff --git a/apps/desktop/src/components/pane-shell/tree/store.ts b/apps/desktop/src/components/pane-shell/tree/store.ts
+index 65647eea76..f5cfad723a 100644
+--- a/apps/desktop/src/components/pane-shell/tree/store.ts
++++ b/apps/desktop/src/components/pane-shell/tree/store.ts
+@@ -1527,14 +1527,18 @@ export function dockPaneBeside(paneId: string, anchorPaneId: string) {
+   }
+ }
+ 
+-export function moveTreePane(paneId: string, target: { groupId: string; pos: DropPosition; before?: null | string }) {
++export function moveTreePane(
++  paneId: string,
++  target: { groupId: string; pos: DropPosition; before?: null | string },
++  origin?: 'user'
++) {
+   const tree = $layoutTree.get()
+ 
+   if (!tree) {
+     return
+   }
+ 
+-  const next = movePaneOp(tree, paneId, target)
++  const next = movePaneOp(tree, paneId, target, origin)
+ 
+   // movePane returns the SAME root for no-op drops ("stays here") — only a
+   // real move customizes the preset or pins the pane as user-placed.
+@@ -1587,7 +1591,8 @@ export function applyTree(tree: LayoutNode, presetId: string) {
+ export function moveTreePanes(
+   paneIds: readonly string[],
+   target: { groupId: string; pos: DropPosition; before?: null | string },
+-  activeId?: string
++  activeId?: string,
++  origin?: 'user'
+ ) {
+   const tree = $layoutTree.get()
+ 
+@@ -1595,7 +1600,7 @@ export function moveTreePanes(
+     return
+   }
+ 
+-  const next = movePanesOp(tree, paneIds, target, activeId)
++  const next = movePanesOp(tree, paneIds, target, activeId, origin)
+ 
+   if (next !== tree) {
+     commit(next)
+diff --git a/apps/desktop/src/lib/tab-split-policy.test.ts b/apps/desktop/src/lib/tab-split-policy.test.ts
+new file mode 100644
+index 0000000000..8ab51a819f
+--- /dev/null
++++ b/apps/desktop/src/lib/tab-split-policy.test.ts
+@@ -0,0 +1,25 @@
++import { describe, expect, it } from 'vitest'
++
++import { shouldAllowTabSplit, TAB_SPLIT_MIN_WIDTH_PX } from './tab-split-policy'
++
++describe('shouldAllowTabSplit', () => {
++  it('allows fine-pointer drops above the minimum width', () => {
++    expect(shouldAllowTabSplit({ coarse: false, width: 1280 })).toBe(true)
++    expect(shouldAllowTabSplit({ coarse: false, width: TAB_SPLIT_MIN_WIDTH_PX + 1 })).toBe(true)
++  })
++
++  it('rejects at and below the width boundary (640 is the last rejected width)', () => {
++    expect(shouldAllowTabSplit({ coarse: false, width: TAB_SPLIT_MIN_WIDTH_PX })).toBe(false)
++    expect(shouldAllowTabSplit({ coarse: false, width: TAB_SPLIT_MIN_WIDTH_PX - 1 })).toBe(false)
++    expect(shouldAllowTabSplit({ coarse: false, width: 390 })).toBe(false)
++  })
++
++  it('rejects coarse pointers regardless of width', () => {
++    expect(shouldAllowTabSplit({ coarse: true, width: 1280 })).toBe(false)
++    expect(shouldAllowTabSplit({ coarse: true, width: TAB_SPLIT_MIN_WIDTH_PX + 1 })).toBe(false)
++  })
++
++  it('zero/negative widths never allow a split', () => {
++    expect(shouldAllowTabSplit({ coarse: false, width: 0 })).toBe(false)
++  })
++})
+diff --git a/apps/desktop/src/lib/tab-split-policy.ts b/apps/desktop/src/lib/tab-split-policy.ts
+new file mode 100644
+index 0000000000..ab5aafa72f
+--- /dev/null
++++ b/apps/desktop/src/lib/tab-split-policy.ts
+@@ -0,0 +1,41 @@
++/**
++ * Touch/viewport policy for SPLIT-shaped drag drops (pane tabs docked on a
++ * zone edge, session rows/tiles dropped on an edge band).
++ *
++ * A split on a phone-width viewport produces unreadable slivers (a 390px
++ * screen split in half is two ~195px columns; the default tree's right rail
++ * is already ~86-105px) whose edge drop targets physically overlap the
++ * narrow drawer hover strips, so the gesture is REJECTED there instead of
++ * committing — desktop (fine pointer, wide viewport) behavior is unchanged.
++ *
++ * The boundary intentionally matches the sidebar-collapse breakpoint
++ * (SIDEBAR_DOCK_MIN_WIDTH_PX = 640): splits are only allowed on viewports
++ * where side rails can still dock, so a split can never outlive the narrow
++ * mode that would make it unreadable.
++ */
++
++/** Minimum viewport width at which a split drop may commit. */
++export const TAB_SPLIT_MIN_WIDTH_PX = 640
++
++export interface TabSplitPolicyInput {
++  /** Whether the primary pointer is coarse (touch). */
++  coarse: boolean
++  width: number
++}
++
++/** Pure policy: may a split-shaped drop commit in this context? */
++export function shouldAllowTabSplit({ coarse, width }: TabSplitPolicyInput): boolean {
++  return !coarse && width > TAB_SPLIT_MIN_WIDTH_PX
++}
++
++/** Runtime resolver for drag-commit gates (browser-only; false elsewhere). */
++export function tabSplitAllowedNow(): boolean {
++  if (typeof window === 'undefined') {
++    return false
++  }
++
++  return shouldAllowTabSplit({
++    coarse: window.matchMedia?.('(pointer: coarse)').matches ?? false,
++    width: window.innerWidth
++  })
++}
+diff --git a/apps/desktop/src/store/session-states.ts b/apps/desktop/src/store/session-states.ts
+index ec277b3534..42a18c401f 100644
+--- a/apps/desktop/src/store/session-states.ts
++++ b/apps/desktop/src/store/session-states.ts
+@@ -1439,7 +1439,8 @@ export function openSessionTile(
+   dir: TileDock = 'right',
+   anchor?: string,
+   before?: null | string,
+-  explicitScope?: SessionTileWorkspaceScope
++  explicitScope?: SessionTileWorkspaceScope,
++  origin?: 'user'
+ ) {
+   const tiles = $sessionTiles.get()
+   const existing = tiles.find(t => t.storedSessionId === storedSessionId)
+@@ -1507,7 +1508,7 @@ export function openSessionTile(
+   const target = tree ? findGroupOfPane(tree, dock ?? 'workspace')?.id : null
+ 
+   if (target) {
+-    moveTreePane(`${TILE_PANE_PREFIX}${storedSessionId}`, { before: before ?? null, groupId: target, pos: dir })
++    moveTreePane(`${TILE_PANE_PREFIX}${storedSessionId}`, { before: before ?? null, groupId: target, pos: dir }, origin)
+     patchSessionTile(storedSessionId, { anchor: dock, before: before ?? undefined, dir })
+     syncTileStripOrder()
+   }
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index c8faae7386..b19334cefd 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3611,4 +3611,11 @@ button,
+     min-height: 44px;
+     min-width: 44px;
+   }
++
++  /* The layout editor card is the narrow-viewport path to "restore single
++     column" (Layout tool → edit mode → Reset): its action buttons meet the
++     same 44px touch minimum there. */
++  [data-tree-edit-bar] button {
++    min-height: 44px;
++  }
+ }

@@ -1,0 +1,343 @@
+From 8049db63695646dbc6c7380326a611d58f48a32e Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 10:30:23 +0800
+Subject: [PATCH 20/32] fix(desktop): skills page owns the phone viewport (list
+ fills, hub collapsed by default)
+
+---
+ apps/desktop/src/app/master-detail.tsx        | 48 +++++------
+ .../app/skills/embedded-hub-picker.test.tsx   | 65 +++++++++++++++
+ .../src/app/skills/embedded-hub-picker.tsx    | 81 ++++++++++++++-----
+ apps/desktop/src/app/skills/index.tsx         | 16 +++-
+ 4 files changed, 163 insertions(+), 47 deletions(-)
+ create mode 100644 apps/desktop/src/app/skills/embedded-hub-picker.test.tsx
+
+diff --git a/apps/desktop/src/app/master-detail.tsx b/apps/desktop/src/app/master-detail.tsx
+index 95e117697b..9b8254fe7d 100644
+--- a/apps/desktop/src/app/master-detail.tsx
++++ b/apps/desktop/src/app/master-detail.tsx
+@@ -117,34 +117,36 @@ export function MasterDetail({
+     <div className="flex h-full min-h-0 flex-col">
+       <div
+         className={cn(
+-          'grid min-h-0 flex-1 grid-cols-1',
++          // Narrow stacks the two columns; the list row fills (1fr) and the
++          // detail row sizes to its content — capped on the detail wrapper
++          // below — so an empty detail collapses to its footer and the list
++          // owns the first paint on phones.
++          'grid min-h-0 flex-1 grid-cols-1 max-sm:grid-rows-[minmax(0,1fr)_auto]',
+           split === 'wide' ? MASTER_DETAIL_WIDE_COLS : 'sm:grid-cols-[14rem_minmax(0,1fr)]'
+         )}
+         ref={gridRef}
+         style={override !== undefined ? ({ '--md-split': `${override}px` } as CSSProperties) : undefined}
+       >
+-        {resizeId ? (
+-          <>
+-            {list}
+-            <div className="relative grid min-h-0 min-w-0">
++        {list}
++        {/* The detail wrapper is unconditional (both consumers share the
++            narrow cap on it); a `resizeId` just adds the seam sash inside. */}
++        <div className="relative grid min-h-0 min-w-0 max-sm:max-h-[55%]">
++          {resizeId ? (
++            <div
++              className="group/vsash absolute inset-y-0 left-0 z-10 hidden w-1 -translate-x-1/2 cursor-col-resize sm:block"
++              onDoubleClick={() => setPaneWidthOverride(resizeId, undefined)}
++              onPointerDown={startSplitDrag}
++            >
+               <div
+-                className="group/vsash absolute inset-y-0 left-0 z-10 hidden w-1 -translate-x-1/2 cursor-col-resize sm:block"
+-                onDoubleClick={() => setPaneWidthOverride(resizeId, undefined)}
+-                onPointerDown={startSplitDrag}
+-              >
+-                <div
+-                  className={cn(
+-                    'absolute inset-y-0 left-1/2 w-px -translate-x-1/2 transition-colors',
+-                    dragging ? 'bg-(--ui-stroke-secondary)' : 'group-hover/vsash:bg-(--ui-stroke-secondary)'
+-                  )}
+-                />
+-              </div>
+-              {rest}
++                className={cn(
++                  'absolute inset-y-0 left-1/2 w-px -translate-y-1/2 transition-colors',
++                  dragging ? 'bg-(--ui-stroke-secondary)' : 'group-hover/vsash:bg-(--ui-stroke-secondary)'
++                )}
++              />
+             </div>
+-          </>
+-        ) : (
+-          children
+-        )}
++          ) : null}
++          {rest}
++        </div>
+       </div>
+       {pane}
+     </div>
+@@ -168,8 +170,8 @@ export function DetailColumn({
+   children,
+   footer
+ }: {
+-  actionBar?: ReactNode
+-  children: ReactNode
++  actionBar?: ReactNode;
++  children: ReactNode;
+   footer?: ReactNode
+ }) {
+   return (
+diff --git a/apps/desktop/src/app/skills/embedded-hub-picker.test.tsx b/apps/desktop/src/app/skills/embedded-hub-picker.test.tsx
+new file mode 100644
+index 0000000000..9cb4d3994f
+--- /dev/null
++++ b/apps/desktop/src/app/skills/embedded-hub-picker.test.tsx
+@@ -0,0 +1,65 @@
++// @vitest-environment jsdom
++import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { $paneHeightOverride, clearAllPaneSizeOverrides } from '@/store/panes'
++
++// The hub's narrow/desktop split is driven by the viewport query; swap the
++// answer per test instead of resizing jsdom.
++const narrow = vi.hoisted(() => ({ matches: false }))
++vi.mock('@/hooks/use-media-query', () => ({ useMediaQuery: () => narrow.matches }))
++
++async function renderPicker() {
++  const { EmbeddedHubPicker } = await import('./embedded-hub-picker')
++  return render(<EmbeddedHubPicker installedNames={new Set()} />)
++}
++
++const iframe = () => document.querySelector('iframe[title="Skills Hub"]')
++const headerRow = () => screen.getByText('Skills Hub').closest('div')
++
++describe('EmbeddedHubPicker narrow collapse (session-local) vs desktop default', () => {
++  beforeEach(() => {
++    narrow.matches = false
++    window.localStorage.clear()
++  })
++
++  afterEach(() => {
++    cleanup()
++    // Reset the in-memory pane store too — the desktop toggle test writes 0.
++    clearAllPaneSizeOverrides()
++    window.localStorage.clear()
++  })
++
++  it('narrow sessions start collapsed; header taps toggle without touching the persisted pane store', async () => {
++    narrow.matches = true
++    const { container } = await renderPicker()
++
++    // Collapsed by default: header visible, no iframe viewport.
++    expect(screen.getByText('Skills Hub')).toBeTruthy()
++    expect(iframe()).toBeNull()
++    expect(container.querySelector('.group\\/hubsash')).toBeNull()
++
++    // Tap the header row (≥44px target on touch) → the hub expands.
++    fireEvent.click(headerRow()!)
++    expect(iframe()).not.toBeNull()
++
++    // Tap again → collapses back; both flips stay out of the persisted store.
++    fireEvent.click(headerRow()!)
++    expect(iframe()).toBeNull()
++    expect($paneHeightOverride('capabilities-hub').get()).toBeUndefined()
++  })
++
++  it('desktop sessions keep the expanded default and the toggle writes the persisted override', async () => {
++    const { container } = await renderPicker()
++
++    // Desktop default is unchanged: expanded, with the drag sash present.
++    expect(iframe()).not.toBeNull()
++    expect(container.querySelector('.group\\/hubsash')).not.toBeNull()
++
++    // The hide toggle writes the persisted collapse override (0), like the
++    // sash — the pre-existing desktop contract.
++    fireEvent.click(screen.getByText('Hide the hub browser'))
++    await waitFor(() => expect($paneHeightOverride('capabilities-hub').get()).toBe(0))
++    expect(iframe()).toBeNull()
++  })
++})
+diff --git a/apps/desktop/src/app/skills/embedded-hub-picker.tsx b/apps/desktop/src/app/skills/embedded-hub-picker.tsx
+index 5c750c2e9f..d29cfb9553 100644
+--- a/apps/desktop/src/app/skills/embedded-hub-picker.tsx
++++ b/apps/desktop/src/app/skills/embedded-hub-picker.tsx
+@@ -3,10 +3,12 @@ import { memo, type PointerEvent as ReactPointerEvent, useEffect, useRef, useSta
+ 
+ import { Button } from '@/components/ui/button'
+ import type { ProfileScope } from '@/hermes'
++import { useMediaQuery } from '@/hooks/use-media-query'
+ import { useI18n } from '@/i18n'
+ import { Loader2 } from '@/lib/icons'
+ import { useStoreSelector } from '@/lib/use-session-slice'
+ import { cn } from '@/lib/utils'
++import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
+ import { $hubActions, installHubSkill, UPDATE_ALL_KEY, updateHubSkills } from '@/store/hub-actions'
+ import { notify, notifyError } from '@/store/notifications'
+ import { $paneHeightOverride, setPaneHeightOverride } from '@/store/panes'
+@@ -58,10 +60,13 @@ interface EmbeddedHubPickerProps {
+ }
+ 
+ /** The Skills Hub browser for the Skills tab: a resizable iframe of the live
+- *  hub where every card installs with one click. Expanded by default —
+- *  discovery IS the point — with a collapse toggle (persisted, like every
+- *  other pane) and an update-all action. Memoized: the iframe must not sit in
+- *  the parent's keystroke/re-render path. */
++ *  hub where every card installs with one click. Expanded by default on
++ *  desktop — discovery IS the point — with a collapse toggle (persisted, like
++ *  every other pane) and an update-all action. Phone-width sessions start
++ *  collapsed (the installed list owns the viewport) with a session-local
++ *  expand state — the persisted height is a desktop preference and must not
++ *  be written from a phone. Memoized: the iframe must not sit in the
++ *  parent's keystroke/re-render path. */
+ export const EmbeddedHubPicker = memo(function EmbeddedHubPicker({
+   hidden = false,
+   installedNames,
+@@ -72,13 +77,16 @@ export const EmbeddedHubPicker = memo(function EmbeddedHubPicker({
+   // Subscribe to the ONE flag this header renders, not the whole action map —
+   // $hubActions churns on every tailed log line during an install.
+   const updating = useStoreSelector($hubActions, actions => actions[UPDATE_ALL_KEY]?.running ?? false)
++  const narrow = useMediaQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)
+   // Collapse state rides the same persisted height override the sash writes
+   // (0 = collapsed to the header), so "Hide the hub browser" survives tab
+   // switches and restarts instead of re-expanding — and re-loading the docs
+-  // site — on every visit. Same contract as DetailPane.
++  // site — on every visit. Same contract as DetailPane. Narrow sessions use
++  // session-local state instead (see docstring above).
+   const heightOverride = useStore($paneHeightOverride(HUB_PANE_ID))
+   const height = heightOverride ?? HUB_DEFAULT_PX
+-  const open = height > HUB_COLLAPSED_PX
++  const [narrowOpen, setNarrowOpen] = useState(false)
++  const open = narrow ? narrowOpen : height > HUB_COLLAPSED_PX
+   const [dragging, setDragging] = useState(false)
+   const sectionRef = useRef<HTMLElement>(null)
+ 
+@@ -177,27 +185,56 @@ export const EmbeddedHubPicker = memo(function EmbeddedHubPicker({
+       )}
+       ref={sectionRef}
+     >
+-      {/* Top-edge drag sash — pull the whole hub section up/down. */}
++      {/* Top-edge sash — pull the whole hub section up/down. Fine-pointer
++          desktop gesture only: a 1px touch target is unusable on phones, and
++          its writes are the persisted (desktop) height preference. */}
++      {!narrow && (
++        <div
++          className="group/hubsash absolute inset-x-0 top-0 z-10 h-1 -translate-y-1/2 cursor-row-resize"
++          onDoubleClick={() => setPaneHeightOverride(HUB_PANE_ID, undefined)}
++          onPointerDown={startDrag}
++        >
++          <div
++            className={cn(
++              'absolute inset-x-0 top-1/2 h-px -translate-y-1/2 transition-colors',
++              dragging ? 'bg-(--ui-stroke-secondary)' : 'group-hover/hubsash:bg-(--ui-stroke-secondary)'
++            )}
++          />
++        </div>
++      )}
++      {/* Narrow: the whole header row toggles the hub (≥44px tap target);
++          buttons stop propagation so they don't double-fire the toggle. */}
+       <div
+-        className="group/hubsash absolute inset-x-0 top-0 z-10 h-1 -translate-y-1/2 cursor-row-resize"
+-        onDoubleClick={() => setPaneHeightOverride(HUB_PANE_ID, undefined)}
+-        onPointerDown={startDrag}
++        className={cn('flex shrink-0 items-center justify-between px-3 py-1.5', narrow && 'cursor-pointer select-none')}
++        onClick={narrow ? () => setNarrowOpen(v => !v) : undefined}
+       >
+-        <div
+-          className={cn(
+-            'absolute inset-x-0 top-1/2 h-px -translate-y-1/2 transition-colors',
+-            dragging ? 'bg-(--ui-stroke-secondary)' : 'group-hover/hubsash:bg-(--ui-stroke-secondary)'
+-          )}
+-        />
+-      </div>
+-      <div className="flex shrink-0 items-center justify-between px-3 py-1.5">
+         <span className="text-[0.7rem] font-medium text-(--ui-text-tertiary)">{h.pickerTitle}</span>
+         <div className="flex items-center gap-1">
+-          <Button disabled={updating} onClick={updateAll} size="xs" variant="text">
++          <Button
++            disabled={updating}
++            onClick={event => {
++              event.stopPropagation()
++              updateAll()
++            }}
++            size="xs"
++            variant="text"
++          >
+             {updating && <Loader2 className="size-3 animate-spin" />}
+             {updating ? h.updating : h.updateAll}
+           </Button>
+-          <Button onClick={() => setPaneHeightOverride(HUB_PANE_ID, open ? 0 : undefined)} size="xs" variant="text">
++          <Button
++            onClick={event => {
++              event.stopPropagation()
++
++              if (narrow) {
++                setNarrowOpen(v => !v)
++              } else {
++                setPaneHeightOverride(HUB_PANE_ID, open ? 0 : undefined)
++              }
++            }}
++            size="xs"
++            variant="text"
++          >
+             {open ? h.pickerHide : h.pickerBrowse}
+           </Button>
+         </div>
+@@ -215,7 +252,9 @@ export const EmbeddedHubPicker = memo(function EmbeddedHubPicker({
+             style={{
+               border: '1px solid var(--ui-stroke-secondary)',
+               borderRadius: 8,
+-              flex: `0 1 ${height}px`,
++              // Narrow sessions have no sash: the viewport takes a fixed share
++              // of the column, leaving the list the majority without a drag.
++              flex: narrow ? '0 1 45%' : `0 1 ${height}px`,
+               maxWidth: '100%',
+               minHeight: 0,
+               minWidth: 320,
+diff --git a/apps/desktop/src/app/skills/index.tsx b/apps/desktop/src/app/skills/index.tsx
+index 81e1dfb1e9..9d79ac6e18 100644
+--- a/apps/desktop/src/app/skills/index.tsx
++++ b/apps/desktop/src/app/skills/index.tsx
+@@ -28,6 +28,7 @@ import {
+   setToolsetEnabled
+ } from '@/hermes'
+ import { useI18n } from '@/i18n'
++import { useMediaQuery } from '@/hooks/use-media-query'
+ import { isDesktopToolsetVisible } from '@/lib/desktop-toolsets'
+ import { compactNumber } from '@/lib/format'
+ import { Loader2 } from '@/lib/icons'
+@@ -43,6 +44,7 @@ import type { OfficialSkillInfo, SkillInfo, ToolsetInfo } from '@/types/hermes'
+ 
+ import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
+ import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
++import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '../layout-constants'
+ import { useRouteEnumParam } from '../hooks/use-route-enum-param'
+ import {
+   CapRow,
+@@ -243,6 +245,11 @@ export function SkillsView({
+ 
+   const [query, setQuery] = useState('')
+ 
++  // Phone-width viewport (same boundary as the shell's sidebar collapse):
++  // drives the stacked-layout exceptions — no auto-selected detail row, hub
++  // collapsed by default.
++  const narrow = useMediaQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)
++
+   // The hub picker hosts a full docs-site iframe — the single most expensive
+   // thing on this page. It mounts lazily (first time the Skills tab is shown)
+   // and then STAYS mounted but hidden across tab switches, so bouncing to
+@@ -502,10 +509,13 @@ export function SkillsView({
+   }, [mode, skills, toolsets, t])
+ 
+   // Keep a valid selection: fall back to the first visible row when the
+-  // current selection is filtered out (or nothing is selected yet).
++  // current selection is filtered out (or nothing is selected yet). Narrow
++  // sessions skip the fallback — with the detail stacked BELOW the list, an
++  // auto-selected first row would claim half the phone screen before the
++  // user has tapped anything; the list owns the first paint.
+   const activeSkill = useMemo(
+-    () => visibleSkills.find(s => s.name === selectedSkill) ?? visibleSkills[0] ?? null,
+-    [selectedSkill, visibleSkills]
++    () => visibleSkills.find(s => s.name === selectedSkill) ?? (narrow ? null : (visibleSkills[0] ?? null)),
++    [selectedSkill, narrow, visibleSkills]
+   )
+ 
+   // A selected catalog row wins the detail pane; it clears when filtered out

@@ -1,0 +1,938 @@
+From 06d8ee995491a4d880ae4f4da07ab97f546e9adf Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 16:00:30 +0800
+Subject: [PATCH 10/32] fix(desktop): touch-reachable TERMINAL close + drawer
+ touch fixes + drag-follow
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+F4c: coarse pointers get a 44px collapse button in tool-panel zone headers
+(the terminal strip the user could not close on phones); it routes through
+the pane's registered closer, so hermes.desktop.terminalTakeover flips to
+false and survives restarts. The narrow drawers stop registering hover
+strips on touch, always render a backdrop, and gain a 44px close button;
+drawers now expose data-narrow-drawer-pane so edge-swipe closes route to
+the revealed pane's id.
+
+F4f: edge swipes are side-aware (right drawer mirrors left) and follow the
+finger — drawerDragProgress/drawerReleaseDecision pure math drives a
+$drawerDrag atom the overlay renders from, mounting the pane at gesture
+start with translateX/opacity tracking; release settles through a 160ms
+transition (snap open, spring back, never jump). All listeners stay
+passive; the vertical-scroll abstain is unchanged.
+---
+ .../app/chat/hooks/use-edge-swipe-drawer.ts   | 218 +++++++++++++--
+ .../tree/renderer/narrow-overlays.tsx         | 253 +++++++++++++-----
+ .../pane-shell/tree/renderer/tree-group.tsx   |  17 ++
+ apps/desktop/src/lib/drawer-drag.test.ts      |  51 ++++
+ apps/desktop/src/lib/drawer-drag.ts           |  69 +++++
+ apps/desktop/src/lib/edge-swipe.test.ts       |  37 +++
+ apps/desktop/src/lib/edge-swipe.ts            |  36 ++-
+ 7 files changed, 582 insertions(+), 99 deletions(-)
+ create mode 100644 apps/desktop/src/lib/drawer-drag.test.ts
+ create mode 100644 apps/desktop/src/lib/drawer-drag.ts
+
+diff --git a/apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts b/apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts
+index 752fcc9a44..391796dee1 100644
+--- a/apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts
++++ b/apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts
+@@ -1,46 +1,89 @@
+ import { useEffect } from 'react'
+ 
+ import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
++import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
+ import { matchesQuery } from '@/hooks/use-media-query'
+-import { classifyEdgeSwipe } from '@/lib/edge-swipe'
+-import { setSidebarOpen } from '@/store/layout'
++import { classifyEdgeSwipe, EDGE_SWIPE_START_MAX_X_PX } from '@/lib/edge-swipe'
++import { drawerDragProgress, $drawerDrag } from '@/lib/drawer-drag'
++import { setFileBrowserOpen, setSidebarOpen } from '@/store/layout'
+ 
+ interface TrackedTouch {
+   identifier: number
+   startX: number
+   startY: number
++  startedAt: number
++}
++
++interface VisibleDrawer {
++  side: 'left' | 'right'
++  paneId: string | null
++  width: number
+ }
+ 
+ // The narrow drawer's reveal state is LOCAL to the overlay component (it
+ // never lives in the layout store), so its rendered node is the only honest
+ // visibility signal — the pane's `open` flag defaults to true and stays true
+ // while the drawer is hidden, which would make every "open" swipe a no-op.
+-function narrowDrawerVisible(): boolean {
+-  return Boolean(document.querySelector("[data-narrow-drawer='left']"))
++// data-narrow-drawer-pane (the close routing channel) is read on release.
++function visibleDrawer(): VisibleDrawer | null {
++  const el =
++    document.querySelector<HTMLElement>("[data-narrow-drawer='left']") ??
++    document.querySelector<HTMLElement>("[data-narrow-drawer='right']")
++
++  if (!el) {
++    return null
++  }
++
++  return {
++    side: el.dataset.narrowDrawer === 'right' ? 'right' : 'left',
++    paneId: el.dataset.narrowDrawerPane ?? null,
++    width: el.offsetWidth
++  }
+ }
+ 
++/** Fallback drawer width for opening gestures (drawer not mounted yet) —
++ *  mirrors the overlay's `min(18rem, 85vw)` default. */
++const drawerWidthProxy = () => Math.min(288, window.innerWidth * 0.85)
++
++/** Horizontal travel needed before a gesture locks to the drag axis. */
++const AXIS_LOCK_DX_PX = 8
++
+ /**
+- * Edge-swipe drawer gesture for narrow viewports.
++ * Edge-swipe drawer gesture for narrow viewports, both edges.
+  *
+- * Registration is pinned to pure observation: touchstart/touchend listeners
+- * are `passive: true` and NOTHING ever calls `preventDefault()` — a passive
++ * Registration is pinned to pure observation: every listener is
++ * `passive: true` and NOTHING ever calls `preventDefault()` — a passive
+  * listener cannot cancel scrolling anyway, and cancelling would fight the
+- * transcript's own scroll. The gesture is classified once, on touchend, by the
+- * pure `classifyEdgeSwipe` contract; only then does it touch drawer state,
+- * through the same setSidebarOpen the titlebar button uses.
++ * transcript's own scroll. Classification runs once, on touchend, through
++ * the pure `classifyEdgeSwipe` contract (side-aware); only then does it
++ * touch drawer state, through the same setters the titlebar buttons use.
++ *
++ * Drag-follow: once a gesture axis-locks horizontal AND addresses a drawer
++ * (starts in a closed side's edge band, or rides an open drawer outward),
++ * every touchmove publishes progress to `$drawerDrag` — the narrow overlay
++ * renders the drawer following the finger, mounting it at gesture start.
++ * Release settles through the same atom (the overlay animates and applies
++ * the final state); pure classification only runs for gestures that never
++ * followed (sub-lock drift released where it started).
+  *
+  * Desktop is untouched twice over: the handler returns early unless the
+  * sidebar-collapse media query matches, and touch events never fire for a
+- * mouse. A second finger landing mid-gesture invalidates it (pinch-zoom must
+- * not toggle the drawer).
++ * mouse. A second finger landing mid-gesture invalidates it (pinch-zoom
++ * must not toggle the drawer).
+  */
+ export function useEdgeSwipeDrawer(): void {
+   useEffect(() => {
+     let tracked: TrackedTouch | null = null
++    let axisLocked = false
++
++    const touchById = (list: TouchList, identifier: number) =>
++      [...list].find(candidate => candidate.identifier === identifier)
+ 
+     const onTouchStart = (event: TouchEvent) => {
+       if (event.touches.length > 1) {
+         tracked = null
++        axisLocked = false
++        $drawerDrag.set(null)
+ 
+         return
+       }
+@@ -51,48 +94,177 @@ export function useEdgeSwipeDrawer(): void {
+         return
+       }
+ 
+-      tracked = { identifier: touch.identifier, startX: touch.clientX, startY: touch.clientY }
++      tracked = {
++        identifier: touch.identifier,
++        startX: touch.clientX,
++        startY: touch.clientY,
++        startedAt: event.timeStamp
++      }
++      axisLocked = false
++    }
++
++    const onTouchMove = (event: TouchEvent) => {
++      const start = tracked
++
++      if (!start) {
++        return
++      }
++
++      const touch = touchById(event.touches, start.identifier)
++
++      if (!touch) {
++        return
++      }
++
++      const dx = touch.clientX - start.startX
++
++      if (!axisLocked) {
++        if (Math.abs(dx) < AXIS_LOCK_DX_PX) {
++          return
++        }
++
++        axisLocked = Math.abs(dx) > Math.abs(touch.clientY - start.startY)
++
++        if (!axisLocked) {
++          tracked = null
++
++          return
++        }
++      }
++
++      const open = visibleDrawer()
++      const side = open?.side ?? (start.startX <= EDGE_SWIPE_START_MAX_X_PX ? 'left' : 'right')
++      const towardCenter = side === 'left' ? dx > 0 : dx < 0
++
++      if (open) {
++        // Riding an open drawer: only the outward direction follows.
++        if (side !== open.side || towardCenter) {
++          return
++        }
++      } else if (!towardCenter) {
++        return
++      }
++
++      const width = open?.width || drawerWidthProxy()
++      const progress = drawerDragProgress({ dx, width })
++
++      $drawerDrag.set({ fraction: open ? 1 - progress : progress, phase: 'drag', side, target: 0 })
+     }
+ 
+     const onTouchEnd = (event: TouchEvent) => {
+       const start = tracked
++      const followed = $drawerDrag.get()?.phase === 'drag'
+ 
+       tracked = null
++      axisLocked = false
++
++      if (!start) {
++        $drawerDrag.set(null)
+ 
+-      if (!start || !matchesQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)) {
+         return
+       }
+ 
+-      const touch = [...event.changedTouches].find(candidate => candidate.identifier === start.identifier)
++      const touch = touchById(event.changedTouches, start.identifier)
+ 
+       if (!touch) {
+         return
+       }
+ 
+-      const gesture = classifyEdgeSwipe({
+-        dx: touch.clientX - start.startX,
+-        dy: touch.clientY - start.startY,
+-        startX: start.startX,
+-        open: narrowDrawerVisible()
+-      })
++      const dx = touch.clientX - start.startX
++      const dy = touch.clientY - start.startY
++      const open = visibleDrawer()
++      const width = open?.width || drawerWidthProxy()
++
++      if (!followed) {
++        if (!matchesQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)) {
++          return
++        }
++
++        const gesture = classifyEdgeSwipe({
++          dx,
++          dy,
++          startX: start.startX,
++          open: Boolean(open),
++          side: open?.side ?? 'left',
++          width: window.innerWidth
++        })
+ 
+-      if (gesture) {
+-        setSidebarOpen(gesture === 'open')
++        if (gesture) {
++          applyGesture(gesture === 'open', open)
++        }
++
++        return
++      }
++
++      // Followed gesture: settle through the atom — the overlay animates to
++      // the target and applies the final state when the transition ends.
++      const side = $drawerDrag.get()?.side ?? open?.side ?? 'left'
++      const dt = event.timeStamp - start.startedAt
++      const commits =
++        Math.abs(dy) <= 40 && (drawerDragProgress({ dx, width }) >= 0.5 || (dt > 0 && Math.abs(dx) / dt >= 0.5))
++
++      if (open) {
++        $drawerDrag.set({
++          fraction: 1 - drawerDragProgress({ dx, width }),
++          phase: 'settle',
++          side,
++          target: commits ? 0 : 1
++        })
++      } else {
++        $drawerDrag.set({
++          fraction: drawerDragProgress({ dx, width }),
++          phase: 'settle',
++          side,
++          target: commits ? 1 : 0
++        })
+       }
+     }
+ 
+     const onTouchCancel = () => {
+       tracked = null
++      axisLocked = false
++      $drawerDrag.set(null)
+     }
+ 
+     document.addEventListener('touchstart', onTouchStart, { passive: true })
++    document.addEventListener('touchmove', onTouchMove, { passive: true })
+     document.addEventListener('touchend', onTouchEnd, { passive: true })
+     document.addEventListener('touchcancel', onTouchCancel, { passive: true })
+ 
+     return () => {
+       document.removeEventListener('touchstart', onTouchStart)
++      document.removeEventListener('touchmove', onTouchMove)
+       document.removeEventListener('touchend', onTouchEnd)
+       document.removeEventListener('touchcancel', onTouchCancel)
+     }
+   }, [])
+ }
++
++function applyGesture(open: boolean, drawer: VisibleDrawer | null): void {
++  const side = drawer?.side ?? 'left'
++
++  if (open) {
++    if (side === 'left') {
++      setSidebarOpen(true)
++    } else {
++      setFileBrowserOpen(true)
++    }
++
++    return
++  }
++
++  if (side === 'left') {
++    // Keeps $sidebarOpen truthful for the resize back to wide.
++    setSidebarOpen(false)
++
++    return
++  }
++
++  if (drawer?.paneId) {
++    window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: drawer.paneId, mode: 'close' } }))
++
++    return
++  }
++
++  setFileBrowserOpen(false)
++}
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+index e7a414950f..5a8f3c2354 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+@@ -4,16 +4,27 @@
+  * breakpoint; an edge strip (hover) or PANE_TOGGLE_REVEAL_EVENT (⌘B / ⌘G /
+  * titlebar toggles route here on narrow) slides the pane OVER the layout
+  * instead of squeezing it. Event reveals pin; hover reveals follow the mouse.
++ *
++ * Touch: hover strips never register (there is no hover), ANY reveal gets a
++ * backdrop, and the drawer carries a ≥44px close button — plus drag-follow
++ * ($drawerDrag, fed by use-edge-swipe-drawer) renders the drawer tracking
++ * the finger and settles with a transition, mounting the pane at gesture
++ * start so the pull-out is live from pixel one.
+  */
+ 
+ import { useStore } from '@nanostores/react'
+-import { useEffect, useMemo, useRef, useState } from 'react'
++import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
+ 
++import { Codicon } from '@/components/ui/codicon'
+ import { PaneTab, PaneTabLabel, PaneTabStrip } from '@/components/ui/pane-tab'
+ import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
+ import { useContributions } from '@/contrib/react/use-contributions'
+ import type { Contribution } from '@/contrib/types'
++import { useMediaQuery } from '@/hooks/use-media-query'
++import { useI18n } from '@/i18n'
++import { DRAWER_SETTLE_MS, $drawerDrag } from '@/lib/drawer-drag'
+ import { ESCAPE_PRIORITY, isTopEscapeLayer, pushEscapeLayer } from '@/lib/escape-layers'
++import { setFileBrowserOpen, setSidebarOpen } from '@/store/layout'
+ import { cn } from '@/lib/utils'
+ 
+ import { PANE_TOGGLE_REVEAL_EVENT } from '../..'
+@@ -22,12 +33,31 @@ import { $hiddenTreePanes, $layoutTree, $narrowViewport } from '../store'
+ 
+ import { paneChrome } from './track-model'
+ 
++type DrawerSide = 'left' | 'right'
++
++const sideOf = (c: Contribution): DrawerSide => (paneChrome(c).placement === 'left' ? 'left' : 'right')
++
++/** Inline visual state for a followed/settling drawer; null = default. */
++interface DragVisual {
++  fraction: number
++  phase: 'drag' | 'settle'
++}
++
++function drawerTransform(side: DrawerSide, fraction: number): string {
++  const offset = side === 'left' ? fraction - 1 : 1 - fraction
++
++  return `translateX(${offset * 100}%)`
++}
++
+ export function NarrowOverlays() {
+   const narrow = useStore($narrowViewport)
+   const tree = useStore($layoutTree)
+   const panes = useContributions('panes')
+   const hiddenPanes = useStore($hiddenTreePanes)
++  const coarse = useMediaQuery('(pointer: coarse)')
++  const { t } = useI18n()
+   const [reveal, setReveal] = useState<{ id: string; pinned: boolean } | null>(null)
++  const drag = useStore($drawerDrag)
+ 
+   // Own an Escape layer only while something is revealed, so Escape closes the
+   // overlay only when it's the top layer (never under a dialog / edit mode).
+@@ -101,11 +131,39 @@ export function NarrowOverlays() {
+     }
+   }, [narrow])
+ 
++  // A settling drag lands here: after the transition window, apply the real
++  // end state (open the owning pane's drawer, or drop the reveal) and clear
++  // the atom. The open-drawer case needs NO remount — its reveal stays put
++  // and only the inline transform goes away.
++  const settleSide = drag?.phase === 'settle' ? drag.side : null
++  useEffect(() => {
++    if (settleSide === null) {
++      return
++    }
++
++    const timer = window.setTimeout(() => {
++      const state = $drawerDrag.get()
++
++      $drawerDrag.set(null)
++
++      if (state?.target === 1) {
++        if (settleSide === 'left') {
++          setSidebarOpen(true)
++        } else {
++          setFileBrowserOpen(true)
++        }
++      } else if (state?.target === 0) {
++        setReveal(current => (current && sideOfSafe(current.id, collapsiblesRef.current) === settleSide ? null : current))
++      }
++    }, DRAWER_SETTLE_MS)
++
++    return () => window.clearTimeout(timer)
++  }, [settleSide, drag?.target, drag?.fraction])
++
+   if (!narrow || collapsibles.length === 0) {
+     return null
+   }
+ 
+-  const sideOf = (c: Contribution) => (paneChrome(c).placement === 'left' ? 'left' : 'right')
+   const revealed = reveal ? collapsibles.find(p => p.id === reveal.id) : undefined
+   const sides = [...new Set(collapsibles.map(sideOf))]
+ 
+@@ -125,80 +183,143 @@ export function NarrowOverlays() {
+     return shown.length > 0 ? shown : [revealed]
+   })()
+ 
++  // Drag-follow visual: an open drawer of the dragged side tracks the finger
++  // directly; a closed side gets a GHOST drawer (the pane mounts at gesture
++  // start — the pull-out is live from pixel one).
++  const revealedSide = revealed ? sideOf(revealed) : null
++  const followingReveal = drag && revealedSide === drag.side ? drag : null
++  const ghostPane =
++    drag && !followingReveal ? collapsibles.find(p => sideOf(p) === drag.side) : undefined
++  const ghostSide = ghostPane ? sideOf(ghostPane) : null
++
++  const dragVisualOf = (side: DrawerSide): DragVisual | null => {
++    const state = followingReveal && revealedSide === side ? followingReveal : drag && ghostSide === side ? drag : null
++
++    return state ? { fraction: state.phase === 'settle' ? state.target : state.fraction, phase: state.phase } : null
++  }
++
++  const drawerStyle = (side: DrawerSide, visual: DragVisual | null) =>
++    visual
++      ? {
++          animation: 'none',
++          transform: drawerTransform(side, visual.fraction),
++          transition: visual.phase === 'settle' ? `transform ${DRAWER_SETTLE_MS}ms ease-out` : 'none'
++        }
++      : undefined
++
++  const backdropOpacity = followingReveal
++    ? followingReveal.phase === 'settle'
++      ? followingReveal.target
++      : followingReveal.fraction
++    : ghostPane && drag
++      ? drag.phase === 'settle'
++        ? drag.target * 0.3
++        : drag.fraction * 0.3
++      : undefined
++
++  const renderDrawerBody = (pane: Contribution, side: DrawerSide, visual: DragVisual | null, zoneStrip: ReactNode) => (
++    <div
++      className={cn(
++        'absolute inset-y-0 z-40 flex flex-col overflow-hidden bg-(--ui-sidebar-surface-background) shadow-2xl',
++        side === 'left' ? 'left-0 border-r border-(--ui-stroke-secondary)' : 'right-0 border-l border-(--ui-stroke-secondary)'
++      )}
++      // Floats OVER the layout, so under glass its surface must mask the
++      // panes beneath it — a see-through overlay reads as text bleeding
++      // through text. Contract: `[data-glass-opaque]` in styles.css.
++      data-glass-opaque=""
++      data-narrow-drawer={side}
++      data-narrow-drawer-pane={pane.id}
++      onMouseLeave={() => setReveal(current => (current?.pinned ? current : null))}
++      style={{
++        ...drawerStyle(side, visual),
++        // Match the pane's docked width (sessions ~237px, files its rail
++        // width) instead of a fat fixed 20rem — capped for tiny screens.
++        width: `min(${(pane.data as { width?: string } | undefined)?.width ?? '18rem'}, 85vw)`
++      }}
++    >
++      {zoneStrip}
++      {coarse && (
++        <button
++          aria-label={t.common.close}
++          className={cn(
++            'absolute z-10 grid size-11 place-items-center rounded-md text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground',
++            side === 'left' ? 'right-1 top-1' : 'left-1 top-1'
++          )}
++          data-narrow-drawer-close=""
++          onClick={() => setReveal(current => (current?.id === pane.id ? null : current))}
++          type="button"
++        >
++          <Codicon name="close" size="1rem" />
++        </button>
++      )}
++      <ContribBoundary id={pane.id}>{pane.render && <ContribRender render={pane.render} />}</ContribBoundary>
++    </div>
++  )
++
++  const zoneStrip =
++    zonePanes.length > 1 && revealed ? (
++      <PaneTabStrip>
++        {zonePanes.map(pane => (
++          <PaneTab
++            active={pane.id === revealed.id}
++            aria-selected={pane.id === revealed.id}
++            data-narrow-overlay-tab={pane.id}
++            key={pane.id}
++            onPointerDown={event => {
++              if (event.button === 0) {
++                event.preventDefault()
++                setReveal(current => ({ id: pane.id, pinned: current?.pinned ?? false }))
++              }
++            }}
++          >
++            <PaneTabLabel>{pane.title ?? pane.id}</PaneTabLabel>
++          </PaneTab>
++        ))}
++      </PaneTabStrip>
++    ) : null
++
+   return (
+     <>
+-      {/* Hover-intent strips on each edge that has a collapsed pane. */}
+-      {sides.map(side => (
+-        <div
+-          className={cn('absolute inset-y-0 z-30 w-1.5', side === 'left' ? 'left-0' : 'right-0')}
+-          key={side}
+-          onMouseEnter={() => {
+-            const first = collapsibles.find(p => sideOf(p) === side)
+-
+-            if (first) {
+-              setReveal(current => (current?.pinned ? current : { id: first.id, pinned: false }))
+-            }
+-          }}
+-        />
+-      ))}
++      {/* Hover-intent strips on each edge that has a collapsed pane — fine
++          pointers only; touch has no hover and the strip only steals taps. */}
++      {!coarse &&
++        sides.map(side => (
++          <div
++            className={cn('absolute inset-y-0 z-30 w-1.5', side === 'left' ? 'left-0' : 'right-0')}
++            key={side}
++            onMouseEnter={() => {
++              const first = collapsibles.find(p => sideOf(p) === side)
+ 
+-      {/* Backdrop for PINNED reveals only (titlebar toggle / ⌘B / touch):
+-          hover reveals keep their weightless come-and-go, while a drawer the
+-          user opened on purpose gets an obvious tap-anywhere-to-close target —
+-          the only dismissal that works without a mouse. */}
+-      {reveal?.pinned && revealed && (
++              if (first) {
++                setReveal(current => (current?.pinned ? current : { id: first.id, pinned: false }))
++              }
++            }}
++          />
++        ))}
++
++      {/* Backdrop: PINNED reveals and ANY touch reveal (an open drawer the
++          user cannot hover away needs a tap-anywhere target), plus the
++          drag-follow veil whose opacity tracks the finger. */}
++      {revealed && (reveal?.pinned || coarse) && (
+         <div
+           aria-hidden
+           className="absolute inset-0 z-30 bg-black/30"
+           onPointerDown={() => setReveal(null)}
++          style={backdropOpacity !== undefined ? { opacity: backdropOpacity } : undefined}
+         />
+       )}
+-
+-      {revealed && (
+-        <div
+-          className={cn(
+-            'absolute inset-y-0 z-40 flex flex-col overflow-hidden bg-(--ui-sidebar-surface-background) shadow-2xl',
+-            sideOf(revealed) === 'left'
+-              ? 'left-0 border-r border-(--ui-stroke-secondary)'
+-              : 'right-0 border-l border-(--ui-stroke-secondary)'
+-          )}
+-          // Floats OVER the layout, so under glass its surface must mask the
+-          // panes beneath it — a see-through overlay reads as text bleeding
+-          // through text. Contract: `[data-glass-opaque]` in styles.css.
+-          data-glass-opaque=""
+-          data-narrow-drawer={sideOf(revealed)}
+-          onMouseLeave={() => setReveal(current => (current?.pinned ? current : null))}
+-          // Match the pane's docked width (sessions ~237px, files its rail
+-          // width) instead of a fat fixed 20rem — capped for tiny screens.
+-          style={{ width: `min(${(revealed.data as { width?: string } | undefined)?.width ?? '18rem'}, 85vw)` }}
+-        >
+-          {/* Zone-mates share the overlay through the zone's own tab strip
+-              (SESSIONS | BOTS) — a lone pane keeps the stripless form. */}
+-          {zonePanes.length > 1 && (
+-            <PaneTabStrip>
+-              {zonePanes.map(pane => (
+-                <PaneTab
+-                  active={pane.id === revealed.id}
+-                  aria-selected={pane.id === revealed.id}
+-                  data-narrow-overlay-tab={pane.id}
+-                  key={pane.id}
+-                  onPointerDown={event => {
+-                    if (event.button === 0) {
+-                      event.preventDefault()
+-                      setReveal(current => ({ id: pane.id, pinned: current?.pinned ?? false }))
+-                    }
+-                  }}
+-                >
+-                  <PaneTabLabel>{pane.title ?? pane.id}</PaneTabLabel>
+-                </PaneTab>
+-              ))}
+-            </PaneTabStrip>
+-          )}
+-          <ContribBoundary id={revealed.id}>
+-            {revealed.render && <ContribRender render={revealed.render} />}
+-          </ContribBoundary>
+-        </div>
++      {ghostPane && drag && (
++        <div aria-hidden className="absolute inset-0 z-30 bg-black/30" style={{ opacity: drag.fraction * 0.3 }} />
+       )}
++
++      {revealed && renderDrawerBody(revealed, sideOf(revealed), dragVisualOf(sideOf(revealed)), zoneStrip)}
++      {ghostPane && ghostSide && renderDrawerBody(ghostPane, ghostSide, dragVisualOf(ghostSide), null)}
+     </>
+   )
+ }
++
++function sideOfSafe(paneId: string, collapsibles: readonly Contribution[]): DrawerSide {
++  const found = collapsibles.find(p => p.id === paneId)
++
++  return found ? sideOf(found) : 'left'
++}
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
+index 2d29aaa2ec..546e2c86ba 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
+@@ -27,6 +27,7 @@ import {
+ } from '@/components/ui/pane-tab'
+ import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
+ import { useContributions } from '@/contrib/react/use-contributions'
++import { useMediaQuery } from '@/hooks/use-media-query'
+ import { useI18n } from '@/i18n'
+ import { useKeybindHint } from '@/lib/keybinds/use-keybind-hint'
+ import { cn } from '@/lib/utils'
+@@ -256,6 +257,10 @@ export function TreeGroup({
+ 
+   const hiddenPanes = useStore($hiddenTreePanes)
+   const narrow = useStore($narrowViewport)
++  // Coarse pointers get a ≥44px collapse affordance in the zone header for
++  // tool-panel zones (terminal): the 20px chevron is unreachable by thumb,
++  // and on narrow the terminal zone is the grid strip the user cannot close.
++  const coarse = useMediaQuery('(pointer: coarse)')
+   const workspaceMode = useStore($workspaceMode)
+   const workspaceOwnerKey = useStore($workspaceOwnerKey)
+   const newSessionTabAction = useStore($newSessionTabAction)
+@@ -520,6 +525,18 @@ export function TreeGroup({
+             style={{ cursor: 'grab' }}
+             trailing={
+               <>
++                {coarse && isCollapsePane(activeId) && !node.minimized && (
++                  <button
++                    aria-label={t.common.close}
++                    className="mr-1 grid size-11 shrink-0 place-items-center self-center rounded-md text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground"
++                    data-zone-collapse={activeId}
++                    onClick={() => collapseTreePane(activeId)}
++                    onPointerDown={e => e.stopPropagation()}
++                    type="button"
++                  >
++                    <Codicon name="close" size="1rem" />
++                  </button>
++                )}
+                 {minimizable && (
+                   <button
+                     aria-label={node.minimized ? t.zones.restore : t.zones.minimize}
+diff --git a/apps/desktop/src/lib/drawer-drag.test.ts b/apps/desktop/src/lib/drawer-drag.test.ts
+new file mode 100644
+index 0000000000..327a7466b2
+--- /dev/null
++++ b/apps/desktop/src/lib/drawer-drag.test.ts
+@@ -0,0 +1,51 @@
++import { describe, expect, it } from 'vitest'
++
++import {
++  DRAWER_COMMIT_FRACTION,
++  DRAWER_COMMIT_VELOCITY_PX_PER_MS,
++  drawerDragProgress,
++  drawerReleaseDecision
++} from './drawer-drag'
++
++describe('drawerDragProgress', () => {
++  it('scales travel by drawer width and clamps to 0..1', () => {
++    expect(drawerDragProgress({ dx: 100, width: 200 })).toBe(0.5)
++    expect(drawerDragProgress({ dx: 300, width: 200 })).toBe(1)
++    expect(drawerDragProgress({ dx: -100, width: 200 })).toBe(0.5)
++    expect(drawerDragProgress({ dx: 0, width: 200 })).toBe(0)
++  })
++
++  it('is safe on degenerate widths', () => {
++    expect(drawerDragProgress({ dx: 100, width: 0 })).toBe(0)
++  })
++})
++
++describe('drawerReleaseDecision', () => {
++  it('commits at and beyond the 50% travel threshold', () => {
++    expect(drawerReleaseDecision({ dx: 200 * DRAWER_COMMIT_FRACTION, dt: 400, width: 200 })).toBe('commit')
++    expect(drawerReleaseDecision({ dx: 200 * (DRAWER_COMMIT_FRACTION - 0.01), dt: 400, width: 200 })).toBe('cancel')
++  })
++
++  it('commits a fast flick below the distance threshold', () => {
++    // 60px in 60ms = 1 px/ms ≥ 0.5, distance only 30%.
++    expect(drawerReleaseDecision({ dx: 60, dt: 60, width: 200 })).toBe('commit')
++  })
++
++  it('cancels a slow short drag', () => {
++    // 40px in 800ms = 0.05 px/ms, distance 20%.
++    expect(drawerReleaseDecision({ dx: 40, dt: 800, width: 200 })).toBe('cancel')
++  })
++
++  it('velocity rung uses magnitude — direction-agnostic', () => {
++    expect(drawerReleaseDecision({ dx: -60, dt: 60, width: 200 })).toBe('commit')
++  })
++
++  it('zero-duration gestures fall back to distance only', () => {
++    expect(drawerReleaseDecision({ dx: 100, dt: 0, width: 200 })).toBe('commit')
++    expect(drawerReleaseDecision({ dx: 10, dt: 0, width: 200 })).toBe('cancel')
++  })
++
++  it('matches the documented velocity constant', () => {
++    expect(DRAWER_COMMIT_VELOCITY_PX_PER_MS).toBe(0.5)
++  })
++})
+diff --git a/apps/desktop/src/lib/drawer-drag.ts b/apps/desktop/src/lib/drawer-drag.ts
+new file mode 100644
+index 0000000000..775cf58c35
+--- /dev/null
++++ b/apps/desktop/src/lib/drawer-drag.ts
+@@ -0,0 +1,69 @@
++/**
++ * Drawer drag-follow math and the atom that carries a live gesture to the
++ * narrow-overlay renderer (see narrow-overlays.tsx). Pure arithmetic only —
++ * the hook (use-edge-swipe-drawer.ts) owns the event plumbing.
++ */
++
++import { atom } from 'nanostores'
++
++/** Release commits the gesture when the drawer travelled at least this
++ *  fraction of its width. */
++export const DRAWER_COMMIT_FRACTION = 0.5
++
++/** ...or reached this velocity (px/ms) — a flick commits early. */
++export const DRAWER_COMMIT_VELOCITY_PX_PER_MS = 0.5
++
++/** ms the settle transition runs before the final state applies. */
++export const DRAWER_SETTLE_MS = 160
++
++export interface DrawerDragProgressInput {
++  /** Horizontal travel of the gesture in px (magnitude). */
++  dx: number
++  /** The drawer's rendered width in px. */
++  width: number
++}
++
++/** Gesture progress 0..1 (clamped): how far the drawer has travelled. */
++export function drawerDragProgress({ dx, width }: DrawerDragProgressInput): number {
++  if (width <= 0) {
++    return 0
++  }
++
++  return Math.min(1, Math.max(0, Math.abs(dx) / width))
++}
++
++export interface DrawerReleaseDecisionInput {
++  dx: number
++  /** Gesture duration in ms (for the velocity rung). */
++  dt: number
++  width: number
++}
++
++export type DrawerReleaseDecision = 'commit' | 'cancel'
++
++/** Commit on ≥50% travel OR a flick past the velocity threshold; anything
++ *  else springs back. */
++export function drawerReleaseDecision({ dx, dt, width }: DrawerReleaseDecisionInput): DrawerReleaseDecision {
++  const progress = drawerDragProgress({ dx, width })
++
++  if (progress >= DRAWER_COMMIT_FRACTION) {
++    return 'commit'
++  }
++
++  const velocity = dt > 0 ? Math.abs(dx) / dt : 0
++
++  return velocity >= DRAWER_COMMIT_VELOCITY_PX_PER_MS ? 'commit' : 'cancel'
++}
++
++export interface DrawerDragState {
++  side: 'left' | 'right'
++  /** Visible fraction 0..1 — follows the finger during `drag`, animates to
++   *  `target` during `settle`. */
++  fraction: number
++  phase: 'drag' | 'settle'
++  /** Where `settle` lands: 1 = drawer ends open, 0 = ends closed. */
++  target: 0 | 1
++}
++
++/** Live drag-follow channel: null when no gesture is addressing a drawer. */
++export const $drawerDrag = atom<DrawerDragState | null>(null)
+diff --git a/apps/desktop/src/lib/edge-swipe.test.ts b/apps/desktop/src/lib/edge-swipe.test.ts
+index 540fab4911..6da750e688 100644
+--- a/apps/desktop/src/lib/edge-swipe.test.ts
++++ b/apps/desktop/src/lib/edge-swipe.test.ts
+@@ -64,6 +64,43 @@ describe('classifyEdgeSwipe', () => {
+     })
+   })
+ 
++  describe('right-side mirror (side: right)', () => {
++    it('closes an open right drawer on an outward (rightward) swipe', () => {
++      expect(classifyEdgeSwipe({ dx: 200, dy: 3, startX: 300, open: true, side: 'right', width: 390 })).toBe('close')
++    })
++
++    it('closes at exactly the minimum travel', () => {
++      expect(classifyEdgeSwipe({ dx: EDGE_SWIPE_MIN_DX_PX, dy: 0, startX: 300, open: true, side: 'right', width: 390 })).toBe('close')
++    })
++
++    it('ignores an inward (leftward) swipe while the right drawer is open', () => {
++      expect(classifyEdgeSwipe({ dx: -200, dy: 0, startX: 300, open: true, side: 'right', width: 390 })).toBeNull()
++    })
++
++    it('opens on a leftward swipe from the right edge band', () => {
++      expect(classifyEdgeSwipe({ dx: -200, dy: 5, startX: 380, open: false, side: 'right', width: 390 })).toBe('open')
++      expect(classifyEdgeSwipe({ dx: -200, dy: 5, startX: 390 - EDGE_SWIPE_START_MAX_X_PX, open: false, side: 'right', width: 390 })).toBe('open')
++    })
++
++    it('rejects a start one pixel inside the right edge band', () => {
++      expect(
++        classifyEdgeSwipe({ dx: -200, dy: 0, startX: 390 - EDGE_SWIPE_START_MAX_X_PX - 1, open: false, side: 'right', width: 390 })
++      ).toBeNull()
++    })
++
++    it('requires the viewport width to resolve the right edge band', () => {
++      expect(classifyEdgeSwipe({ dx: -200, dy: 0, startX: 380, open: false, side: 'right' })).toBeNull()
++    })
++
++    it('rejects a rightward swipe from the right edge', () => {
++      expect(classifyEdgeSwipe({ dx: 200, dy: 0, startX: 385, open: false, side: 'right', width: 390 })).toBeNull()
++    })
++
++    it('dy abstain still holds for the mirrored side', () => {
++      expect(classifyEdgeSwipe({ dx: 200, dy: EDGE_SWIPE_MAX_ABS_DY_PX + 1, startX: 300, open: true, side: 'right', width: 390 })).toBeNull()
++    })
++  })
++
+   it('keeps thresholds on the contract the hook depends on', () => {
+     expect(EDGE_SWIPE_START_MAX_X_PX).toBe(24)
+     expect(EDGE_SWIPE_MIN_DX_PX).toBe(60)
+diff --git a/apps/desktop/src/lib/edge-swipe.ts b/apps/desktop/src/lib/edge-swipe.ts
+index d5324f6eca..f3562bbcf8 100644
+--- a/apps/desktop/src/lib/edge-swipe.ts
++++ b/apps/desktop/src/lib/edge-swipe.ts
+@@ -4,7 +4,7 @@
+ // state — so the threshold contract is unit-testable in isolation. The hook
+ // (app/chat/hooks/use-edge-swipe-drawer.ts) owns only the event plumbing.
+ 
+-/** A gesture starting further from the left edge than this is not an
++/** A gesture starting further from the gesture edge than this is not an
+  *  edge-swipe (iOS reserves roughly this band for the system gesture). */
+ export const EDGE_SWIPE_START_MAX_X_PX = 24
+ 
+@@ -23,6 +23,10 @@ export interface EdgeSwipeInput {
+   startX: number
+   /** Whether the drawer the gesture controls is currently open. */
+   open: boolean
++  /** Which screen edge's drawer the gesture addresses (default: left). */
++  side?: 'left' | 'right'
++  /** Viewport width — required to resolve the RIGHT edge's start band. */
++  width?: number
+ }
+ 
+ export type EdgeSwipeResult = 'close' | 'open' | null
+@@ -30,26 +34,38 @@ export type EdgeSwipeResult = 'close' | 'open' | null
+ /**
+  * Classify one completed touch gesture against the drawer thresholds.
+  *
+- * - Drawer closed: only a rightward swipe STARTING within the edge band opens
+- *   it, so mid-screen horizontal drags (slider UIs, text selection) never
+- *   summon the drawer.
+- * - Drawer open: a leftward swipe from anywhere closes it — the drawer itself
+- *   covers the screen edge, so every close gesture necessarily starts on it.
++ * - Drawer closed: a swipe TOWARD the screen center starting within that
++ *   side's edge band opens it (left edge → rightward, right edge → leftward),
++ *   so mid-screen horizontal drags (slider UIs, text selection) never summon
++ *   a drawer.
++ * - Drawer open: a swipe OUTWARD (toward its own edge) from anywhere closes
++ *   it — the drawer covers that edge, so every close gesture necessarily
++ *   starts on it.
+  * - Anything else — too short, too diagonal, or a repeat of the current state
+  *   — is `null` and must not touch drawer state.
+  */
+-export function classifyEdgeSwipe({ dx, dy, startX, open }: EdgeSwipeInput): EdgeSwipeResult {
++export function classifyEdgeSwipe({ dx, dy, startX, open, side = 'left', width }: EdgeSwipeInput): EdgeSwipeResult {
+   if (Math.abs(dy) > EDGE_SWIPE_MAX_ABS_DY_PX) {
+     return null
+   }
+ 
+   if (open) {
+-    return dx <= -EDGE_SWIPE_MIN_DX_PX ? 'close' : null
++    const outward = side === 'left' ? dx <= -EDGE_SWIPE_MIN_DX_PX : dx >= EDGE_SWIPE_MIN_DX_PX
++
++    return outward ? 'close' : null
++  }
++
++  if (side === 'left') {
++    if (startX > EDGE_SWIPE_START_MAX_X_PX) {
++      return null
++    }
++
++    return dx >= EDGE_SWIPE_MIN_DX_PX ? 'open' : null
+   }
+ 
+-  if (startX > EDGE_SWIPE_START_MAX_X_PX) {
++  if (width === undefined || startX < width - EDGE_SWIPE_START_MAX_X_PX) {
+     return null
+   }
+ 
+-  return dx >= EDGE_SWIPE_MIN_DX_PX ? 'open' : null
++  return dx <= -EDGE_SWIPE_MIN_DX_PX ? 'open' : null
+ }

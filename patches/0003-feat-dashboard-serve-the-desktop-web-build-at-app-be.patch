@@ -1,0 +1,340 @@
+From dc089080409d124182a0e5ae981f4add9fb6c633 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 08:36:06 +0800
+Subject: [PATCH 03/32] feat(dashboard): serve the desktop web build at /app
+ behind the auth gate
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+HERMES_WEB_APP_DIST (mirroring HERMES_WEB_DIST) opts a dashboard process
+into serving apps/desktop/dist-web at /app: hashed assets under /app/assets
+with the immutable cache header, real dist files served as files, and the
+index (no-store) carrying the same token/auth bootstrap the dashboard SPA
+gets — token injected exactly once on loopback, never when gated. The mount
+registers inside mount_spa() BEFORE the catch-all route (a later /app would
+be unreachable — Starlette matches in registration order), redirects /app to
+the canonical /app/ so the build's relative asset URLs resolve correctly,
+and stays off entirely in headless serve mode and when the env is unset
+(byte-identical catch-all baseline, covered by test). The gate is
+default-deny, so /app sits behind the cookie session with no extra wiring.
+---
+ hermes_cli/web_server.py               |   3 +
+ hermes_cli/web_server_dashboard.py     |  92 +++++++++++--
+ tests/hermes_cli/test_web_app_mount.py | 171 +++++++++++++++++++++++++
+ 3 files changed, 256 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_cli/test_web_app_mount.py
+
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 5ffffc9a69..88beaad2ee 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -56,6 +56,9 @@ except ImportError:
+         )
+ 
+ WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
++# Optional browser build of the desktop renderer (apps/desktop/dist-web), served at
++# /app by web_server_dashboard when set. Same deployment-fact shape as WEB_DIST.
++WEB_APP_DIST = Path(os.environ["HERMES_WEB_APP_DIST"]) if "HERMES_WEB_APP_DIST" in os.environ else None
+ _log = logging.getLogger(__name__)
+ 
+ 
+diff --git a/hermes_cli/web_server_dashboard.py b/hermes_cli/web_server_dashboard.py
+index 510d9906e0..5739a4eecb 100644
+--- a/hermes_cli/web_server_dashboard.py
++++ b/hermes_cli/web_server_dashboard.py
+@@ -10,7 +10,7 @@ import threading
+ import time
+ import yaml
+ from fastapi import FastAPI, Request
+-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
++from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+ from fastapi.staticfiles import StaticFiles
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+@@ -90,6 +90,84 @@ _HEADLESS_MSG = (
+ )
+ 
+ 
++class _ImmutableAssetFiles(StaticFiles):
++    """StaticFiles that marks hashed bundle assets immutable so reloads skip revalidation."""
++
++    async def get_response(self, path: str, scope):
++        response = await super().get_response(path, scope)
++        if response.status_code == 200:
++            response.headers["Cache-Control"] = _IMMUTABLE_ASSET_CACHE_CONTROL
++        return response
++
++
++def _mount_web_app_before_catchall(application: FastAPI):
++    """Serve the desktop renderer's browser build (HERMES_WEB_APP_DIST) at /app.
++
++    MUST be called before mount_spa registers its ``/{full_path:path}`` catch-all:
++    Starlette matches in registration order, so a later /app is unreachable. Unset
++    env → no routes and zero behavior change for existing deployments; headless
++    serve never mounts it (same policy as the dashboard SPA). The auth gate is
++    default-deny, so /app lands behind the cookie session automatically.
++    """
++    from hermes_cli.web_server import WEB_APP_DIST
++    from hermes_cli.web_deps import _server
++
++    if os.environ.get("HERMES_SERVE_HEADLESS") == "1":
++        return
++    if not WEB_APP_DIST:
++        return
++
++    def _serve_web_index() -> Response:
++        """index.html with the same token/auth bootstrap the dashboard SPA gets.
++
++        Gated mode injects no token (identity comes from the session cookie);
++        ``__HERMES_AUTH_REQUIRED__`` tells the web bridge which WS auth leg to use.
++        """
++        try:
++            html = (WEB_APP_DIST / "index.html").read_text(encoding="utf-8")
++        except OSError:
++            return JSONResponse(
++                {"error": "Web app not built. Run: cd apps/desktop && npm run build:web"}, status_code=404
++            )
++        gated = bool(getattr(application.state, "auth_required", False))
++        token_js = "" if gated else f'window.__HERMES_SESSION_TOKEN__="{_server()._SESSION_TOKEN}";'
++        bootstrap_script = (
++            f"<script>{token_js}"
++            f"window.__HERMES_AUTH_REQUIRED__={'true' if gated else 'false'};"
++            "</script>"
++        )
++        html = html.replace("</head>", f"{bootstrap_script}</head>", 1)
++        return HTMLResponse(html, headers=_NO_STORE)
++
++    application.mount(
++        "/app/assets", _ImmutableAssetFiles(directory=WEB_APP_DIST / "assets", check_dir=False), name="web-app-assets"
++    )
++
++    # The build uses relative asset URLs (base: './'), which resolve against the
++    # document's directory: /app would resolve them against the site root. Canonical
++    # URL is /app/ — redirect the bare form and any non-file deep path there.
++    @application.get("/app")
++    async def serve_web_app_root(request: Request):
++        query = f"?{request.url.query}" if request.url.query else ""
++        return RedirectResponse(f"/app/{query}", status_code=307)
++
++    @application.get("/app/{full_path:path}")
++    async def serve_web_app_path(full_path: str):
++        # Real files (emojibase data, icons, ds-assets) are served as files; full_path
++        # "" is the canonical app URL. Anything else redirects to /app/ so relative
++        # asset URLs keep resolving correctly (hash routes live after the #).
++        if full_path == "":
++            return _serve_web_index()
++        file_path = WEB_APP_DIST / full_path
++        if (
++            file_path.resolve().is_relative_to(WEB_APP_DIST.resolve())
++            and file_path.exists()
++            and file_path.is_file()
++        ):
++            return FileResponse(file_path)
++        return RedirectResponse("/app/", status_code=307)
++
++
+ def mount_spa(application: FastAPI):
+     """Mount the built SPA; unmatched paths fall back to index.html for client-side routing.
+ 
+@@ -189,20 +267,14 @@ def mount_spa(application: FastAPI):
+             content=css, media_type="text/css", headers={"Cache-Control": _IMMUTABLE_ASSET_CACHE_CONTROL}
+         )
+ 
+-    class _ImmutableAssetFiles(StaticFiles):
+-        """StaticFiles that marks hashed bundle assets immutable so reloads skip revalidation."""
+-
+-        async def get_response(self, path: str, scope):
+-            response = await super().get_response(path, scope)
+-            if response.status_code == 200:
+-                response.headers["Cache-Control"] = _IMMUTABLE_ASSET_CACHE_CONTROL
+-            return response
+-
+     # check_dir=False: the dist may not exist yet; StaticFiles 404s per-request until it does.
+     application.mount(
+         "/assets", _ImmutableAssetFiles(directory=WEB_DIST / "assets", check_dir=False), name="assets"
+     )
+ 
++    # Before the catch-all below: a later /app registration would be unreachable.
++    _mount_web_app_before_catchall(application)
++
+     @application.get("/{full_path:path}")
+     async def serve_spa(full_path: str, request: Request):
+         prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
+diff --git a/tests/hermes_cli/test_web_app_mount.py b/tests/hermes_cli/test_web_app_mount.py
+new file mode 100644
+index 0000000000..067d3809bf
+--- /dev/null
++++ b/tests/hermes_cli/test_web_app_mount.py
+@@ -0,0 +1,171 @@
++"""Contract tests for the /app mount (HERMES_WEB_APP_DIST browser build).
++
++Covers the correctness points the plan calls out:
++- /app is registered BEFORE mount_spa's catch-all (a later registration would be
++  permanently shadowed — Starlette matches in registration order);
++- loopback index injects the session token exactly once; gated index injects
++  none and flags __HERMES_AUTH_REQUIRED__=true;
++- the auth gate is default-deny, so /app and /app/assets/* sit behind the cookie
++  session (302 → /login when gated, ws-ticket mint 401s unauthenticated);
++- hashed assets carry the immutable cache header and a javascript content-type
++  (content-level discrimination: a catch-all fallback would serve text/html);
++- real files under the dist (emojibase data) are served as files, hash routes
++  fall back to index, traversal attempts never escape the dist;
++- with HERMES_WEB_APP_DIST unset, /app behaves byte-identically to any other
++  unmatched path (the catch-all baseline — NOT a 404).
++"""
++
++import pytest
++from fastapi import FastAPI
++from starlette.testclient import TestClient
++
++INDEX_MARKER = "<!--web-app-fixture-->"
++INDEX_HTML = (
++    '<!doctype html><html><head>'
++    '<link rel="manifest" href="./manifest.webmanifest">'
++    "</head>"
++    f"<body>{INDEX_MARKER}</body></html>"
++)
++
++
++@pytest.fixture
++def web_app_dist(tmp_path):
++    dist = tmp_path / "dist-web"
++    (dist / "assets").mkdir(parents=True)
++    (dist / "emojibase/en").mkdir(parents=True)
++    (dist / "index.html").write_text(INDEX_HTML, encoding="utf-8")
++    (dist / "assets/index-test.js").write_text("console.log('web')", encoding="utf-8")
++    (dist / "emojibase/en/data.json").write_text('{"emojis": []}', encoding="utf-8")
++    return dist
++
++
++def _fresh_mounted_app(monkeypatch, web_app_dist):
++    """A fresh FastAPI app with mount_spa() applied while WEB_APP_DIST is patched.
++
++    mount_spa must be called AFTER the patch so _mount_web_app_before_catchall
++    sees the dist — exactly how import order plays out in the real process
++    (web_server reads HERMES_WEB_APP_DIST at import, mount_spa(app) at :975).
++    """
++    import hermes_cli.web_server as web_server
++    from hermes_cli.web_server_dashboard import mount_spa
++
++    monkeypatch.setattr(web_server, "WEB_APP_DIST", web_app_dist)
++    app = FastAPI()
++    mount_spa(app)
++    return app
++
++
++def _gated(app):
++    app.state.auth_required = True
++
++    @app.middleware("http")
++    async def _gate(request, call_next):
++        from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
++
++        return await gated_auth_middleware(request, call_next)
++
++    return app
++
++
++class TestMountOrder:
++    def test_app_reachable_not_swallowed_by_catchall(self, monkeypatch, web_app_dist):
++        app = _fresh_mounted_app(monkeypatch, web_app_dist)
++        client = TestClient(app)
++        # Bare /app redirects to the canonical /app/ (relative asset URLs need the
++        # trailing slash); following it must land on the WEB app's index, proving
++        # the route beats mount_spa's catch-all.
++        res = client.get("/app", follow_redirects=False)
++        assert res.status_code == 307
++        assert res.headers["location"] == "/app/"
++        final = client.get("/app/")
++        assert final.status_code == 200
++        assert INDEX_MARKER in final.text
++        assert "manifest.webmanifest" in final.text
++
++    def test_unset_env_app_equals_catchall_baseline_byte_identical(self, monkeypatch, web_app_dist):
++        import hermes_cli.web_server as web_server
++        from hermes_cli.web_server_dashboard import mount_spa
++
++        monkeypatch.setattr(web_server, "WEB_APP_DIST", None)
++        app = FastAPI()
++        mount_spa(app)
++        client = TestClient(app)
++        app_res = client.get("/app")
++        baseline_res = client.get("/__probe_unmatched_path")
++        assert app_res.status_code == baseline_res.status_code
++        assert app_res.content == baseline_res.content
++
++
++class TestIndexInjection:
++    def test_loopback_index_injects_token_once(self, monkeypatch, web_app_dist):
++        app = _fresh_mounted_app(monkeypatch, web_app_dist)
++        res = TestClient(app).get("/app/")
++        assert res.status_code == 200
++        assert res.text.count("__HERMES_SESSION_TOKEN__") == 1
++        assert "__HERMES_AUTH_REQUIRED__=false" in res.text
++        assert "no-store" in res.headers["cache-control"].lower()
++
++    def test_gated_index_has_no_token(self, monkeypatch, web_app_dist):
++        app = _fresh_mounted_app(monkeypatch, web_app_dist)
++        # No middleware here — the route reads application.state directly, which
++        # is exactly the flag start_server flips in production.
++        app.state.auth_required = True
++        res = TestClient(app, follow_redirects=False).get("/app/")
++        assert res.status_code == 200
++        assert "__HERMES_SESSION_TOKEN__" not in res.text
++        assert "__HERMES_AUTH_REQUIRED__=true" in res.text
++
++
++class TestAssetsAndFiles:
++    def test_hashed_asset_immutable_and_javascript(self, monkeypatch, web_app_dist):
++        app = _fresh_mounted_app(monkeypatch, web_app_dist)
++        res = TestClient(app).get("/app/assets/index-test.js")
++        assert res.status_code == 200
++        assert "immutable" in res.headers.get("cache-control", "")
++        assert "javascript" in res.headers["content-type"]
++
++    def test_dist_file_served_as_file_not_index(self, monkeypatch, web_app_dist):
++        app = _fresh_mounted_app(monkeypatch, web_app_dist)
++        res = TestClient(app).get("/app/emojibase/en/data.json")
++        assert res.status_code == 200
++        assert res.text == '{"emojis": []}'
++
++    def test_deep_non_file_path_redirects_to_canonical_app_url(self, monkeypatch, web_app_dist):
++        app = _fresh_mounted_app(monkeypatch, web_app_dist)
++        res = TestClient(app, follow_redirects=False).get("/app/session/abc/def")
++        assert res.status_code == 307
++        assert res.headers["location"] == "/app/"
++
++    def test_traversal_never_escapes_dist(self, monkeypatch, web_app_dist):
++        app = _fresh_mounted_app(monkeypatch, web_app_dist)
++        client = TestClient(app)
++        # httpx normalizes ../ client-side and the route re-resolves within the
++        # dist; either way the invariant is that no host file content leaks.
++        for probe in ("/app/../../etc/passwd", "/app/..%2f..%2fetc%2fpasswd"):
++            res = client.get(probe)
++            assert "root:" not in res.text
++            assert res.status_code == 200 or res.status_code in (400, 404)
++
++
++class TestGate:
++    def test_app_paths_are_not_public(self):
++        from hermes_cli.dashboard_auth.middleware import _path_is_public
++
++        assert not _path_is_public("/app")
++        assert not _path_is_public("/app/assets/index-test.js")
++
++    def test_gated_app_redirects_to_login(self, monkeypatch, web_app_dist):
++        app = _fresh_mounted_app(monkeypatch, web_app_dist)
++        _gated(app)
++        res = TestClient(app, follow_redirects=False).get("/app")
++        assert res.status_code == 302
++        assert res.headers["location"].startswith("/login")
++
++    def test_gated_ws_ticket_unauthorized_without_session(self, monkeypatch, web_app_dist):
++        from hermes_cli.dashboard_auth.routes import router as dashboard_auth_router
++
++        app = _fresh_mounted_app(monkeypatch, web_app_dist)
++        _gated(app)
++        app.include_router(dashboard_auth_router)
++        res = TestClient(app).post("/api/auth/ws-ticket")
++        assert res.status_code in (401, 403)

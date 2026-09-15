@@ -1,0 +1,43 @@
+From e2eb9d53cb6c1e33650d0e9ca780dfda61017e14 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 16:29:39 +0800
+Subject: [PATCH 13/32] fix(desktop): coarse chat-top-gap 6px -> 23px
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Live 390px audit: the transcript's real internal top offset is 0 (the
+plan's 17px baseline offset doesn't exist on a fresh transcript), so a
+6px gap left the first bubble at surface+6 — still 9px under the
+cluster bottom with safe-top 59. 23px applies the same clearance
+arithmetic as the zone-strip margin (cluster bottom 49 + 8 − band 34):
+first bubble now clears the toolbar by exactly 8px on coarse; fine
+pointer padding stays max(−8px,0)+0 = 0, pixel-identical.
+---
+ apps/desktop/src/styles.css | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index eba4d3db66..d43a97d145 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3540,14 +3540,16 @@ html:has([data-hud-shell]) [data-slot='popover-content'] {
+   --safe-bottom: env(safe-area-inset-bottom, 0px);
+   --keyboard-inset: 0px;
+   /* Coarse pointers add this much clearance below the in-flow titlebar for
+-     the transcript's first bubble (thread/list.tsx top pad). Fine pointers
+-     keep 0 — pixel-neutral. */
++     the transcript's first bubble (thread/list.tsx top pad). Same arithmetic
++     as the zone-strip margin below (cluster bottom 49 + 8 breathing room −
++     titlebar band 34) so the first message clears the toolbar exactly like
++     the first tab row. Fine pointers keep 0 — pixel-neutral. */
+   --chat-top-gap: 0px;
+ }
+ 
+ @media (pointer: coarse) {
+   :root {
+-    --chat-top-gap: 6px;
++    --chat-top-gap: 23px;
+   }
+ }
+ 

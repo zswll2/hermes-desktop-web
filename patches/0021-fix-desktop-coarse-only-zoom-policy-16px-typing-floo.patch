@@ -1,0 +1,50 @@
+From 4001f2d719d850ec885a02d38ed0b7af6dcda3ae Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 10:43:25 +0800
+Subject: [PATCH 21/32] fix(desktop): coarse-only zoom policy - 16px typing
+ floor + manipulation touch
+
+---
+ apps/desktop/src/styles.css | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index 3d9827070a..3aa6af5a1a 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3573,6 +3573,35 @@ html {
+   font-size: max(1rem, 16px);
+ }
+ 
++/* Zoom policy for touch (no fake disable): iOS ≥10 ignores
++   user-scalable=no, so we never add it. Instead, coarse pointers kill the
++   300ms double-tap delay on interactive + scroll surfaces
++   (touch-action: manipulation keeps pan AND pinch) and hold EVERY typing
++   surface at ≥16px so focusing one never auto-zooms the page. Fine pointers
++   are outside the media query — desktop computed styles stay untouched. */
++@media (pointer: coarse) {
++  a,
++  [role='tab'],
++  summary,
++  label {
++    touch-action: manipulation;
++  }
++
++  [data-chat-surface],
++  [data-narrow-drawer],
++  [data-overlay-surface] {
++    touch-action: manipulation;
++  }
++
++  input,
++  textarea,
++  select,
++  [contenteditable='true'] {
++    font-size: max(16px, 1em);
++    touch-action: manipulation;
++  }
++}
++
+ /* Keep transcript scrolling contained: no whole-page rubber-banding past the
+    thread, and no double-tap-zoom delay on interactive controls. */
+ [data-chat-surface] {

@@ -1,0 +1,212 @@
+From 75be73978e092acf4d842fae55044e0916c511ba Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 16:47:47 +0800
+Subject: [PATCH 14/32] fix(desktop): freeze edge-swipe gesture target on first
+ qualifying move
+
+Live drag-follow debugging (CDP touch stream): once the ghost drawer
+mounts under the finger, re-reading the DOM mid-gesture mistakes it for
+an open drawer and drops the follow after one move. The gesture now
+resolves its target side/open-state/width once, on the first qualifying
+move, and every later move runs pure math against that snapshot; the
+listeners also move to capture phase because the mounted pane content
+(the sessions sortable) can stop touch events in the bubble phase.
+390px Playwright: half-open follow, sub-threshold spring-back, and
+commit-to-open all verified.
+---
+ .../app/chat/hooks/use-edge-swipe-drawer.ts   | 105 ++++++++++--------
+ 1 file changed, 60 insertions(+), 45 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts b/apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts
+index 391796dee1..0042bb637c 100644
+--- a/apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts
++++ b/apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts
+@@ -75,6 +75,10 @@ export function useEdgeSwipeDrawer(): void {
+   useEffect(() => {
+     let tracked: TrackedTouch | null = null
+     let axisLocked = false
++    // Resolved on the FIRST qualifying move and frozen for the gesture: the
++    // drag-follow ghost mounts a drawer mid-gesture, so re-reading the DOM
++    // would mistake the ghost for an open drawer and drop the follow.
++    let follow: { side: 'left' | 'right'; wasOpen: boolean; paneId: string | null; width: number } | null = null
+ 
+     const touchById = (list: TouchList, identifier: number) =>
+       [...list].find(candidate => candidate.identifier === identifier)
+@@ -83,6 +87,7 @@ export function useEdgeSwipeDrawer(): void {
+       if (event.touches.length > 1) {
+         tracked = null
+         axisLocked = false
++        follow = null
+         $drawerDrag.set(null)
+ 
+         return
+@@ -101,6 +106,7 @@ export function useEdgeSwipeDrawer(): void {
+         startedAt: event.timeStamp
+       }
+       axisLocked = false
++      follow = null
+     }
+ 
+     const onTouchMove = (event: TouchEvent) => {
+@@ -118,47 +124,52 @@ export function useEdgeSwipeDrawer(): void {
+ 
+       const dx = touch.clientX - start.startX
+ 
+-      if (!axisLocked) {
+-        if (Math.abs(dx) < AXIS_LOCK_DX_PX) {
+-          return
+-        }
++      if (!follow) {
++        if (!axisLocked) {
++          if (Math.abs(dx) < AXIS_LOCK_DX_PX) {
++            return
++          }
+ 
+-        axisLocked = Math.abs(dx) > Math.abs(touch.clientY - start.startY)
++          axisLocked = Math.abs(dx) > Math.abs(touch.clientY - start.startY)
+ 
+-        if (!axisLocked) {
+-          tracked = null
++          if (!axisLocked) {
++            tracked = null
+ 
+-          return
++            return
++          }
+         }
+-      }
+ 
+-      const open = visibleDrawer()
+-      const side = open?.side ?? (start.startX <= EDGE_SWIPE_START_MAX_X_PX ? 'left' : 'right')
+-      const towardCenter = side === 'left' ? dx > 0 : dx < 0
++        const open = visibleDrawer()
++        const side = open?.side ?? (start.startX <= EDGE_SWIPE_START_MAX_X_PX ? 'left' : 'right')
++        const towardCenter = side === 'left' ? dx > 0 : dx < 0
+ 
+-      if (open) {
+-        // Riding an open drawer: only the outward direction follows.
+-        if (side !== open.side || towardCenter) {
++        if (open) {
++          // Riding an open drawer: only the outward direction follows.
++          if (towardCenter) {
++            return
++          }
++        } else if (!towardCenter) {
+           return
+         }
+-      } else if (!towardCenter) {
+-        return
++
++        follow = { paneId: open?.paneId ?? null, side, wasOpen: Boolean(open), width: open?.width || drawerWidthProxy() }
+       }
+ 
+-      const width = open?.width || drawerWidthProxy()
++      const width = follow.width
+       const progress = drawerDragProgress({ dx, width })
+ 
+-      $drawerDrag.set({ fraction: open ? 1 - progress : progress, phase: 'drag', side, target: 0 })
++      $drawerDrag.set({ fraction: follow.wasOpen ? 1 - progress : progress, phase: 'drag', side: follow.side, target: 0 })
+     }
+ 
+     const onTouchEnd = (event: TouchEvent) => {
+       const start = tracked
+-      const followed = $drawerDrag.get()?.phase === 'drag'
++      const followed = follow !== null
+ 
+       tracked = null
+       axisLocked = false
+ 
+       if (!start) {
++        follow = null
+         $drawerDrag.set(null)
+ 
+         return
+@@ -172,14 +183,16 @@ export function useEdgeSwipeDrawer(): void {
+ 
+       const dx = touch.clientX - start.startX
+       const dy = touch.clientY - start.startY
+-      const open = visibleDrawer()
+-      const width = open?.width || drawerWidthProxy()
+ 
+       if (!followed) {
++        follow = null
++        $drawerDrag.set(null)
++
+         if (!matchesQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)) {
+           return
+         }
+ 
++        const open = visibleDrawer()
+         const gesture = classifyEdgeSwipe({
+           dx,
+           dy,
+@@ -198,24 +211,21 @@ export function useEdgeSwipeDrawer(): void {
+ 
+       // Followed gesture: settle through the atom — the overlay animates to
+       // the target and applies the final state when the transition ends.
+-      const side = $drawerDrag.get()?.side ?? open?.side ?? 'left'
+-      const dt = event.timeStamp - start.startedAt
+-      const commits =
+-        Math.abs(dy) <= 40 && (drawerDragProgress({ dx, width }) >= 0.5 || (dt > 0 && Math.abs(dx) / dt >= 0.5))
++      const state = follow
++      follow = null
++
++      if (state) {
++        const dt = event.timeStamp - start.startedAt
++        const commits =
++          Math.abs(dy) <= 40 &&
++          (drawerDragProgress({ dx, width: state.width }) >= 0.5 || (dt > 0 && Math.abs(dx) / dt >= 0.5))
++        const fraction = drawerDragProgress({ dx, width: state.width })
+ 
+-      if (open) {
+-        $drawerDrag.set({
+-          fraction: 1 - drawerDragProgress({ dx, width }),
+-          phase: 'settle',
+-          side,
+-          target: commits ? 0 : 1
+-        })
+-      } else {
+         $drawerDrag.set({
+-          fraction: drawerDragProgress({ dx, width }),
++          fraction: state.wasOpen ? 1 - fraction : fraction,
+           phase: 'settle',
+-          side,
+-          target: commits ? 1 : 0
++          side: state.side,
++          target: state.wasOpen ? (commits ? 0 : 1) : commits ? 1 : 0
+         })
+       }
+     }
+@@ -223,19 +233,24 @@ export function useEdgeSwipeDrawer(): void {
+     const onTouchCancel = () => {
+       tracked = null
+       axisLocked = false
++      follow = null
+       $drawerDrag.set(null)
+     }
+ 
+-    document.addEventListener('touchstart', onTouchStart, { passive: true })
+-    document.addEventListener('touchmove', onTouchMove, { passive: true })
+-    document.addEventListener('touchend', onTouchEnd, { passive: true })
+-    document.addEventListener('touchcancel', onTouchCancel, { passive: true })
++    // Capture phase: the drag-follow ghost mounts the pane content UNDER the
++    // finger mid-gesture, and that content (the sessions list's sortable
++    // rows) may stop touch events in the bubble phase — capture keeps the
++    // gesture's own listeners first in line while staying passive.
++    document.addEventListener('touchstart', onTouchStart, { passive: true, capture: true })
++    document.addEventListener('touchmove', onTouchMove, { passive: true, capture: true })
++    document.addEventListener('touchend', onTouchEnd, { passive: true, capture: true })
++    document.addEventListener('touchcancel', onTouchCancel, { passive: true, capture: true })
+ 
+     return () => {
+-      document.removeEventListener('touchstart', onTouchStart)
+-      document.removeEventListener('touchmove', onTouchMove)
+-      document.removeEventListener('touchend', onTouchEnd)
+-      document.removeEventListener('touchcancel', onTouchCancel)
++      document.removeEventListener('touchstart', onTouchStart, { capture: true })
++      document.removeEventListener('touchmove', onTouchMove, { capture: true })
++      document.removeEventListener('touchend', onTouchEnd, { capture: true })
++      document.removeEventListener('touchcancel', onTouchCancel, { capture: true })
+     }
+   }, [])
+ }

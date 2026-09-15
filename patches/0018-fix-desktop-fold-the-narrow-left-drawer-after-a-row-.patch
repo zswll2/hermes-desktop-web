@@ -1,0 +1,365 @@
+From b2df4fb4a92278cb8af3cf0251d58177f96c1956 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 18:57:43 +0800
+Subject: [PATCH 18/32] fix(desktop): fold the narrow left drawer after a row
+ selection
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+User ruling: picking a session (or a Bots roster / group row) on a narrow
+viewport should land the user straight in the chat, not leave the drawer
+over it. The desktop docked rail is untouched: the closer routes through
+revealNarrowPane, which no-ops above the sidebar-collapse breakpoint.
+
+- layout: export closeNarrowSidebarDrawer() (narrow-gated by construction)
+- narrow overlay: a 'close' reveal intent is now side-scoped — the drawer
+  may front ANY pane of the sessions zone (SESSIONS | BOTS strip) and the
+  dispatcher cannot know which tab is active
+- sessions rows: both list paths (flat + virtualized) funnel through one
+  resume wrapper that folds after handing off to the caller
+- bot & group rows: same helper via the plugin SDK; a failed bot open
+  already surfaces its own notification, so the fold is never silent
+
+E2E 390x844: drawer folds on selection, route lands the picked session;
+1280: rail width byte-identical before/after selection.
+---
+ .../chat/sidebar/sessions-section.test.tsx    | 79 ++++++++++++++++++-
+ .../src/app/chat/sidebar/sessions-section.tsx | 19 ++++-
+ .../tree/renderer/narrow-overlays.test.tsx    | 32 ++++++++
+ .../tree/renderer/narrow-overlays.tsx         | 18 ++++-
+ .../src/plugins/hermes-bots/bot-row.tsx       | 10 ++-
+ .../src/plugins/hermes-bots/roster-pane.tsx   |  6 +-
+ apps/desktop/src/sdk/index.ts                 |  5 ++
+ apps/desktop/src/store/layout.ts              | 10 +++
+ 8 files changed, 168 insertions(+), 11 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/sidebar/sessions-section.test.tsx b/apps/desktop/src/app/chat/sidebar/sessions-section.test.tsx
+index ee0a3cf90e..05828db26f 100644
+--- a/apps/desktop/src/app/chat/sidebar/sessions-section.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/sessions-section.test.tsx
+@@ -9,6 +9,16 @@ import type { VirtualSessionListProps } from './virtual-session-list'
+ 
+ afterEach(cleanup)
+ 
++// The resume path folds the narrow drawer after handing off to the caller —
++// spy on the layout seam without disturbing the rest of the module.
++const { closeNarrowSidebarDrawer } = vi.hoisted(() => ({ closeNarrowSidebarDrawer: vi.fn() }))
++
++vi.mock('@/store/layout', async importOriginal => {
++  const actual = await importOriginal<typeof import('@/store/layout')>()
++
++  return { ...actual, closeNarrowSidebarDrawer }
++})
++
+ vi.mock('@/i18n', () => ({
+   useI18n: () => ({
+     t: {
+@@ -36,10 +46,14 @@ vi.mock('./virtual-session-list', () => ({
+   }
+ }))
+ 
++const mockRowPropsHistory: Array<{ onResume?: () => void; session: SessionInfo }> = []
++
+ vi.mock('./session-row', () => ({
+-  SidebarSessionRow: ({ session }: { session: SessionInfo }) => (
+-    <div data-testid={`session-row-${session.id}`}>{session.id}</div>
+-  )
++  SidebarSessionRow: (props: { session: SessionInfo }) => {
++    mockRowPropsHistory.push(props)
++
++    return <div data-testid={`session-row-${props.session.id}`}>{props.session.id}</div>
++  }
+ }))
+ 
+ function makeSession(id: string, startedAt = 1000): SessionInfo {
+@@ -182,3 +196,62 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
+     expect(thirdRowsRef).not.toBe(secondRowsRef)
+   })
+ })
++
++describe('session resume folds the narrow drawer', () => {
++  const sectionProps = (onResumeSession: (id: string, session?: SessionInfo) => void, sessions: SessionInfo[]) => ({
++    activeSessionId: null,
++    emptyState: <div>Empty</div>,
++    label: 'Sessions',
++    onArchiveSession: noop,
++    onDeleteSession: noop,
++    onResumeSession,
++    onToggle: noop,
++    onTogglePin: noop,
++    onToggleUnread: noop,
++    open: true,
++    pinned: false,
++    sessions
++  })
++
++  it('virtual path: the wrapped onResumeSession hands off to the caller, then folds', () => {
++    mockVirtualListPropsHistory.length = 0
++    closeNarrowSidebarDrawer.mockClear()
++
++    const order: string[] = []
++    const onResumeSession = vi.fn(() => order.push('caller'))
++
++    closeNarrowSidebarDrawer.mockImplementation(() => order.push('closer'))
++
++    render(<SidebarSessionsSection {...sectionProps(onResumeSession, generateSessions(VIRTUALIZE_THRESHOLD + 5))} />)
++
++    expect(mockVirtualListPropsHistory.length).toBe(1)
++    mockVirtualListPropsHistory[0].onResumeSession('session-2')
++
++    expect(onResumeSession).toHaveBeenCalledWith('session-2', undefined)
++    expect(closeNarrowSidebarDrawer).toHaveBeenCalledTimes(1)
++    expect(order).toEqual(['caller', 'closer'])
++  })
++
++  it('flat path: a row resume hands off to the caller, then folds', () => {
++    mockRowPropsHistory.length = 0
++    closeNarrowSidebarDrawer.mockClear()
++
++    const order: string[] = []
++    const onResumeSession = vi.fn(() => order.push('caller'))
++
++    closeNarrowSidebarDrawer.mockImplementation(() => order.push('closer'))
++
++    const sessions = generateSessions(3)
++
++    render(<SidebarSessionsSection {...sectionProps(onResumeSession, sessions)} />)
++
++    const row = mockRowPropsHistory.find(props => props.session.id === 'session-2')
++
++    expect(row).toBeTruthy()
++    row!.onResume!()
++
++    expect(onResumeSession).toHaveBeenCalledWith('session-2', sessions[1])
++    expect(closeNarrowSidebarDrawer).toHaveBeenCalledTimes(1)
++    expect(order).toEqual(['caller', 'closer'])
++  })
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/sessions-section.tsx b/apps/desktop/src/app/chat/sidebar/sessions-section.tsx
+index 1104a8d2ab..b37d22fb3a 100644
+--- a/apps/desktop/src/app/chat/sidebar/sessions-section.tsx
++++ b/apps/desktop/src/app/chat/sidebar/sessions-section.tsx
+@@ -23,6 +23,7 @@ import { cn } from '@/lib/utils'
+ import {
+   $sidebarListGroupIds,
+   $sidebarWorkspaceNodeOpen,
++  closeNarrowSidebarDrawer,
+   listGroupNodeId,
+   toggleWorkspaceNodeCollapsed
+ } from '@/store/layout'
+@@ -252,6 +253,18 @@ export function SidebarSessionsSection({
+   // grouped/tree views always sort by creation date and never drag.
+   const sessionsDraggable = sortable && !!onReorderSessions
+ 
++  // Resuming a session is the drawer's exit on narrow viewports: the user
++  // picked a conversation to SEE it, so the left drawer folds (desktop docked
++  // sidebar is untouched — the closer is narrow-gated). Both list paths (flat
++  // renderRow and VirtualSessionList) flow through this single wrapper.
++  const resumeSession = useCallback(
++    (sessionId: string, session?: SessionInfo) => {
++      onResumeSession(sessionId, session)
++      closeNarrowSidebarDrawer()
++    },
++    [onResumeSession]
++  )
++
+   // Only Pinned arrives pre-ordered as a flat sequence. Recents keeps its
+   // recency sort — the drag order is layered on per date group below, so the
+   // buckets stay truthful and a reorder never costs the list its dividers.
+@@ -272,7 +285,7 @@ export function SidebarSessionsSection({
+         onDelete: () => onDeleteSession(session.id),
+         onPin: () => onTogglePin(sessionPinId(session)),
+         onToggleUnread: () => onToggleUnread(session.id),
+-        onResume: () => onResumeSession(session.id, session),
++        onResume: () => resumeSession(session.id, session),
+         reorderable: draggable && !branchStem,
+         session,
+         showProfile: showProfileTags,
+@@ -294,10 +307,10 @@ export function SidebarSessionsSection({
+       onArchiveSession,
+       onBranchSession,
+       onDeleteSession,
+-      onResumeSession,
+       onTogglePin,
+       onToggleUnread,
+       pinned,
++      resumeSession,
+       showProfileTags
+     ]
+   )
+@@ -546,7 +559,7 @@ export function SidebarSessionsSection({
+         onArchiveSession={onArchiveSession}
+         onBranchSession={onBranchSession}
+         onDeleteSession={onDeleteSession}
+-        onResumeSession={onResumeSession}
++        onResumeSession={resumeSession}
+         onTogglePin={onTogglePin}
+         onToggleUnread={onToggleUnread}
+         pinned={pinned}
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.test.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.test.tsx
+index 9f5e2baa8c..03361bb39d 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.test.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.test.tsx
+@@ -91,4 +91,36 @@ describe('narrow overlay of a stacked zone', () => {
+     expect(getByTestId('sessions-body')).toBeTruthy()
+     expect(overlayTab('sessions')).toBeNull()
+   })
++
++  // A row selection folds the drawer without knowing which zone tab fronts it
++  // (closeNarrowSidebarDrawer always names the sessions pane) — close is
++  // side-scoped, not tab-scoped.
++  it('a close naming one left pane dismisses the drawer whichever zone tab is active', () => {
++    const { getByTestId, queryByTestId } = render(<NarrowOverlays />)
++
++    revealPane('bots')
++    expect(getByTestId('bots-body')).toBeTruthy()
++
++    act(() => {
++      window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: 'sessions', mode: 'close' } }))
++    })
++
++    expect(queryByTestId('bots-body')).toBeNull()
++  })
++
++  it('a close naming a left pane leaves a right-side reveal alone', () => {
++    registerPane('files', 'files', { collapsible: true, placement: 'right', width: '200px' }, 'file rail')
++    $layoutTree.set(split('row', [group(['sessions', 'bots']), group(['workspace']), group(['files'])]))
++
++    const { getByTestId } = render(<NarrowOverlays />)
++
++    revealPane('files')
++    expect(getByTestId('files-body')).toBeTruthy()
++
++    act(() => {
++      window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: 'sessions', mode: 'close' } }))
++    })
++
++    expect(getByTestId('files-body')).toBeTruthy()
++  })
+ })
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+index 40bd38e00b..6c1f267763 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+@@ -80,7 +80,11 @@ export function NarrowOverlays() {
+       }
+ 
+       // `open`/`close` are explicit intents (programmatic reveal, titlebar show);
+-      // `toggle` (default) is the ⌘B/⌘G flip.
++      // `toggle` (default) is the ⌘B/⌘G flip. `close` is side-scoped, not
++      // tab-scoped: the sessions zone's drawer may be showing ANY of its
++      // stacked panes (SESSIONS | BOTS strip), and closing "the left sidebar"
++      // must dismiss that drawer whichever tab is active — a row selection
++      // fires it without knowing which pane fronts the strip.
+       const mode = detail?.mode ?? 'toggle'
+       setReveal(current => {
+         if (mode === 'open') {
+@@ -88,7 +92,17 @@ export function NarrowOverlays() {
+         }
+ 
+         if (mode === 'close') {
+-          return current?.id === match.id ? null : current
++          if (!current) {
++            return current
++          }
++
++          if (current.id === match.id) {
++            return null
++          }
++
++          const currentPane = collapsiblesRef.current.find(p => p.id === current.id)
++
++          return currentPane && sideOf(currentPane) === sideOf(match) ? null : current
+         }
+ 
+         return current?.id === match.id && current.pinned ? null : { id: match.id, pinned: true }
+diff --git a/apps/desktop/src/plugins/hermes-bots/bot-row.tsx b/apps/desktop/src/plugins/hermes-bots/bot-row.tsx
+index 48f60acc4d..7f4bd806a2 100644
+--- a/apps/desktop/src/plugins/hermes-bots/bot-row.tsx
++++ b/apps/desktop/src/plugins/hermes-bots/bot-row.tsx
+@@ -7,6 +7,7 @@
+  */
+ 
+ import {
++  closeNarrowSidebarDrawer,
+   cn,
+   coarseElapsed,
+   Codicon,
+@@ -210,8 +211,13 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
+   }
+ 
+   // Rows and Active Now share the exact-owner open path; only that path may
+-  // activate a source and resolve the canonical Bot Chat.
+-  const open = () => void openRosterBot(bot)
++  // activate a source and resolve the canonical Bot Chat. The narrow drawer
++  // folds right after (a failed open surfaces its own notification, so the
++  // close is never silent) — the desktop docked rail is untouched.
++  const open = () => {
++    void openRosterBot(bot)
++    closeNarrowSidebarDrawer()
++  }
+ 
+   // DRAG lives on the row button itself: it already takes pointer events, so
+   // the click that opens the bot and the drag that files it are one element's
+diff --git a/apps/desktop/src/plugins/hermes-bots/roster-pane.tsx b/apps/desktop/src/plugins/hermes-bots/roster-pane.tsx
+index 8d82d7dd36..9107b2f3b0 100644
+--- a/apps/desktop/src/plugins/hermes-bots/roster-pane.tsx
++++ b/apps/desktop/src/plugins/hermes-bots/roster-pane.tsx
+@@ -12,6 +12,7 @@ import {
+   Button,
+   cn,
+   Codicon,
++  closeNarrowSidebarDrawer,
+   ConfirmDialog,
+   DisclosureCaret,
+   DropdownMenu,
+@@ -574,7 +575,10 @@ export function BotsPane() {
+       members={row.members}
+       needsYou={Boolean(groupNeedsYou[row.name])}
+       onDisband={setDeletingGroup}
+-      onOpen={openGroupChat}
++      onOpen={group => {
++        openGroupChat(group)
++        closeNarrowSidebarDrawer()
++      }}
+     />
+   )
+ 
+diff --git a/apps/desktop/src/sdk/index.ts b/apps/desktop/src/sdk/index.ts
+index d6cbf207b6..f6cabd2d7e 100644
+--- a/apps/desktop/src/sdk/index.ts
++++ b/apps/desktop/src/sdk/index.ts
+@@ -1618,6 +1618,11 @@ export { Contribute, type ContributeProps } from '@/contrib/react/contribute'
+ // -- contracts ----------------------------------------------------------------
+ 
+ export type { Contribution } from '@/contrib/types'
++/** Dismiss the left drawer's narrow reveal after an explicit selection (a
++ *  session / bot / group row click). No-op above the sidebar-collapse
++ *  breakpoint — a plugin row may call it unconditionally; the desktop's
++ *  docked sidebar is never collapsed by selection. */
++export { closeNarrowSidebarDrawer } from '@/store/layout'
+ /** The live gateway instance type — for typing the `gateway` prop `McpTab`
+  *  takes; obtain the instance from `host.getGateway()`. */
+ export type { HermesGateway } from '@/hermes'
+diff --git a/apps/desktop/src/store/layout.ts b/apps/desktop/src/store/layout.ts
+index e9b2676a22..66da363663 100644
+--- a/apps/desktop/src/store/layout.ts
++++ b/apps/desktop/src/store/layout.ts
+@@ -516,6 +516,16 @@ export function setSidebarOpen(open: boolean) {
+   revealNarrowPane(CHAT_SIDEBAR_PANE_ID, open ? 'open' : 'close')
+ }
+ 
++/**
++ * Dismiss the left drawer's narrow reveal after an explicit selection (a
++ * session / bot / group row). Narrow-only by construction — revealNarrowPane
++ * no-ops above the collapse breakpoint, so the docked sidebar a desktop user
++ * keeps open is never touched.
++ */
++export function closeNarrowSidebarDrawer() {
++  revealNarrowPane(CHAT_SIDEBAR_PANE_ID, 'close')
++}
++
+ export function toggleSidebarOpen() {
+   if (!revealNarrowPane(CHAT_SIDEBAR_PANE_ID, 'toggle')) {
+     togglePane(CHAT_SIDEBAR_PANE_ID)

@@ -1,0 +1,200 @@
+From f0b857a6d6f209b656553509de385d4ea7439e6f Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 16:40:16 +0800
+Subject: [PATCH 25/32] fix(desktop): narrow right-sidebar toggle heals the
+ pane instead of no-oping
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On a phone the show-right-sidebar press dispatched PANE_TOGGLE_REVEAL with
+the 'file-browser' alias, but the files pane sat outside collapsibles — its
+visibility binding hides it while $fileBrowserOpen is false (the rail boots
+closed), and a stale dismissal removes it from the tree — so the handler's
+match lookup returned and the press did nothing (r6's zero-code M3 verdict
+only held after desktop-width preprocessing). When the id resolves to a
+registered collapsible pane that isn't currently revealable, run it through
+revealTreePane (un-dismiss, adopt, un-hide, un-collapse its column) and
+open the drawer anyway; unknown ids still no-op. The backdrop gains a
+data-narrow-backdrop marker for the same reason the drawer and close button
+have theirs. Regression tests cover the hidden-pane and dismissed-pane
+routes with backdrop + close-button assertions.
+---
+ .../tree/renderer/narrow-overlays.test.tsx    | 83 ++++++++++++++++++-
+ .../tree/renderer/narrow-overlays.tsx         | 33 +++++++-
+ 2 files changed, 110 insertions(+), 6 deletions(-)
+
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.test.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.test.tsx
+index 03361bb39d..b962f31242 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.test.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.test.tsx
+@@ -1,11 +1,11 @@
+ import { act, cleanup, fireEvent, render } from '@testing-library/react'
+-import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
++import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
+ import { registry } from '@/contrib/registry'
+ import { stubResizeObserver } from '@/test/jsdom'
+ 
+-import { group, split } from '../model'
++import { allPaneIds, group, split } from '../model'
+ import { $hiddenTreePanes, $layoutTree, $narrowViewport, declareDefaultTree } from '../store'
+ 
+ import { NarrowOverlays } from './narrow-overlays'
+@@ -123,4 +123,83 @@ describe('narrow overlay of a stacked zone', () => {
+ 
+     expect(getByTestId('files-body')).toBeTruthy()
+   })
++
++  // r7 N3 regression: the titlebar's show-right-sidebar press routes here with
++  // the pane-state ALIAS while the files pane sits outside `collapsibles` —
++  // hidden (the right rail boots closed, so its binding hid the pane at every
++  // phone's first paint) or dismissed out of the tree. The press must HEAL the
++  // pane and open the drawer anyway, not silently no-op (which is what r6's
++  // "zero-code" M3 verdict missed).
++  describe('a toggle naming a pane outside collapsibles', () => {
++    const coarseMedia = () => {
++      const mql = { addEventListener: vi.fn(), matches: true, removeEventListener: vi.fn() }
++
++      vi.stubGlobal('matchMedia', vi.fn().mockReturnValue(mql))
++    }
++
++    afterEach(() => {
++      vi.unstubAllGlobals()
++    })
++
++    const registerFiles = () =>
++      registerPane(
++        'files',
++        'files',
++        { collapsible: true, placement: 'right', revealAliases: ['file-browser'], width: '200px' },
++        'file rail'
++      )
++
++    it('heals a chrome-hidden pane and still opens the drawer with backdrop and close button', () => {
++      coarseMedia()
++      registerFiles()
++      $layoutTree.set(split('row', [group(['sessions', 'bots']), group(['workspace']), group(['files'])]))
++      $hiddenTreePanes.set(new Set(['files']))
++
++      const { getByTestId } = render(<NarrowOverlays />)
++
++      act(() => {
++        window.dispatchEvent(
++          new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: 'file-browser', mode: 'toggle' } })
++        )
++      })
++
++      expect(getByTestId('files-body')).toBeTruthy()
++      expect(document.querySelector('[data-narrow-drawer="right"]')).toBeTruthy()
++      expect(document.querySelector('[data-narrow-drawer-close]')).toBeTruthy()
++      expect(document.querySelector('[data-narrow-backdrop]')).toBeTruthy()
++      expect($hiddenTreePanes.get().has('files')).toBe(false)
++    })
++
++    it('re-adopts a dismissed pane that left the tree and still opens the drawer', () => {
++      coarseMedia()
++      registerFiles()
++      // Dismissed: files is gone from the tree entirely.
++      $layoutTree.set(split('row', [group(['sessions', 'bots']), group(['workspace'])]))
++
++      const { getByTestId } = render(<NarrowOverlays />)
++
++      act(() => {
++        window.dispatchEvent(
++          new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: 'file-browser', mode: 'open' } })
++        )
++      })
++
++      expect(getByTestId('files-body')).toBeTruthy()
++      expect($layoutTree.get() ? allPaneIds($layoutTree.get()!).includes('files') : false).toBe(true)
++    })
++
++    it('still ignores an id no registered collapsible pane answers to', () => {
++      coarseMedia()
++
++      const { queryByTestId } = render(<NarrowOverlays />)
++
++      act(() => {
++        window.dispatchEvent(
++          new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: 'no-such-pane', mode: 'toggle' } })
++        )
++      })
++
++      expect(queryByTestId('sessions-body')).toBeNull()
++    })
++  })
+ })
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+index 6c1f267763..5b19879c2b 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+@@ -24,7 +24,7 @@ import { cn } from '@/lib/utils'
+ 
+ import { PANE_TOGGLE_REVEAL_EVENT } from '../..'
+ import { allPaneIds, findGroupOfPane } from '../model'
+-import { $hiddenTreePanes, $layoutTree, $narrowViewport } from '../store'
++import { $hiddenTreePanes, $layoutTree, $narrowViewport, revealTreePane } from '../store'
+ 
+ import { paneChrome } from './track-model'
+ 
+@@ -56,6 +56,9 @@ export function NarrowOverlays() {
+   const collapsiblesRef = useRef(collapsibles)
+   collapsiblesRef.current = collapsibles
+ 
++  const panesRef = useRef(panes)
++  panesRef.current = panes
++
+   // ⌘B / ⌘G's narrow branch dispatches the app's toggle-reveal event with the
+   // REAL pane id — accept those via each contribution's revealAliases.
+   useEffect(() => {
+@@ -73,7 +76,25 @@ export function NarrowOverlays() {
+         return
+       }
+ 
+-      const match = collapsiblesRef.current.find(p => p.id === id || paneChrome(p).revealAliases?.includes(id))
++      const mode = detail?.mode ?? 'toggle'
++      let match = collapsiblesRef.current.find(p => p.id === id || paneChrome(p).revealAliases?.includes(id))
++
++      if (!match && mode !== 'close') {
++        // The named pane sits OUTSIDE collapsibles when a chrome toggle hid it
++        // ($hiddenTreePanes — the right rail BOOTS closed, so `files` is
++        // hidden at every phone's first paint) or a stale dismissal took it
++        // out of the tree. The titlebar button still promises a drawer, so
++        // heal the pane (un-dismiss, adopt, un-hide, un-collapse its column)
++        // and reveal anyway instead of pressing on nothing.
++        const recoverable = panesRef.current.find(
++          p => paneChrome(p).collapsible && (p.id === id || paneChrome(p).revealAliases?.includes(id))
++        )
++
++        if (recoverable) {
++          revealTreePane(recoverable.id)
++          match = recoverable
++        }
++      }
+ 
+       if (!match) {
+         return
+@@ -85,7 +106,6 @@ export function NarrowOverlays() {
+       // stacked panes (SESSIONS | BOTS strip), and closing "the left sidebar"
+       // must dismiss that drawer whichever tab is active — a row selection
+       // fires it without knowing which pane fronts the strip.
+-      const mode = detail?.mode ?? 'toggle'
+       setReveal(current => {
+         if (mode === 'open') {
+           return { id: match.id, pinned: true }
+@@ -239,7 +259,12 @@ export function NarrowOverlays() {
+       {/* Backdrop: PINNED reveals and ANY touch reveal (an open drawer the
+           user cannot hover away needs a tap-anywhere target). */}
+       {revealed && (reveal?.pinned || coarse) && (
+-        <div aria-hidden className="absolute inset-0 z-30 bg-black/30" onPointerDown={() => setReveal(null)} />
++        <div
++          aria-hidden
++          className="absolute inset-0 z-30 bg-black/30"
++          data-narrow-backdrop=""
++          onPointerDown={() => setReveal(null)}
++        />
+       )}
+ 
+       {revealed && renderDrawerBody(revealed, sideOf(revealed), zoneStrip)}

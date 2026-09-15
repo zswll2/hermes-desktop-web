@@ -1,0 +1,73 @@
+From ade4b66ce1549d63af7d72bb9d010d3b65cba385 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 17:47:10 +0800
+Subject: [PATCH 15/32] fix(desktop): coarse drawer strip + close button clear
+ toolbar via 23px lockstep
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Drawer tab strips (narrow overlays) overlapped the coarse 44px titlebar
+clusters by 15px: the in-tree [data-zone-tabstrip] fix never reached them.
+Mark the drawer strip data-narrow-drawer-strip (not data-zone-tabstrip —
+that is the drag-drop stacking hit-test key) and mirror the 23px/44px
+coarse rule; the coarse close button rides the same displacement (top 23).
+PaneTab gains role=tab (strip parent already exposes tablist).
+---
+ .../tree/renderer/narrow-overlays.tsx           |  9 ++++++++-
+ apps/desktop/src/styles.css                     | 17 +++++++++++++++++
+ 2 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+index 5a8f3c2354..60654d282c 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+@@ -258,7 +258,13 @@ export function NarrowOverlays() {
+ 
+   const zoneStrip =
+     zonePanes.length > 1 && revealed ? (
+-      <PaneTabStrip>
++      <PaneTabStrip
++        // Marks the drawer's strip for the coarse-pointer clearance rule in
++        // styles.css. Deliberately NOT data-zone-tabstrip — that attribute is
++        // the drag-drop stacking hit-test key (drag-session.ts) and the
++        // drawer strip must stay out of drag hit-testing.
++        data-narrow-drawer-strip=""
++      >
+         {zonePanes.map(pane => (
+           <PaneTab
+             active={pane.id === revealed.id}
+@@ -271,6 +277,7 @@ export function NarrowOverlays() {
+                 setReveal(current => ({ id: pane.id, pinned: current?.pinned ?? false }))
+               }
+             }}
++            role="tab"
+           >
+             <PaneTabLabel>{pane.title ?? pane.id}</PaneTabLabel>
+           </PaneTab>
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index d43a97d145..3d9827070a 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3649,4 +3649,21 @@ button,
+     margin-top: 23px;
+     min-height: 44px;
+   }
++
++  /* Narrow-drawer tab strips: SAME arithmetic, mirrored for the overlay
++     drawer strip (which cannot carry data-zone-tabstrip — that attribute is
++     the drag-drop stacking key and the drawer must stay out of drag
++     hit-testing). Change band/touch sizes in lockstep with the rule above. */
++  [data-narrow-drawer-strip] {
++    margin-top: 23px;
++    min-height: 44px;
++  }
++
++  /* …and the drawer close button rides the same displacement: flush with
++     the strip band (same 23px) so it clears the toolbar clusters by the
++     same 8px. Tabs live at the strip's left; the button at the drawer's
++     right — no hit-rect contact. Fine pointers never render it. */
++  [data-narrow-drawer-close] {
++    top: 23px;
++  }
+ }

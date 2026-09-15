@@ -1,0 +1,40 @@
+From 0c6c549324d6a39b89c5c42549c4ae740582015d Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 21:16:27 +0800
+Subject: [PATCH 30/32] fix(desktop): coarse bottom stack clears the
+ home-indicator band via the shared drawer baseline
+
+---
+ apps/desktop/src/styles.css | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index 7da02d7af5..5008f4f923 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3670,6 +3670,25 @@ button,
+   [data-narrow-reveal] [data-slot='composer-dock']:not([data-popped-out]) {
+     bottom: var(--drawer-bottom-align);
+   }
++
++  /* Non-reveal bottom stack, same single baseline: the statusbar carries the
++     inset as margin so the stack orders dock → statusbar → home-indicator
++     band (whole stack bottom = viewport − var(--drawer-bottom-align), which
++     is ≤ viewport − var(--safe-bottom)). Margin on the statusbar — NOT
++     padding on the shell — because the shell is the overlay drawers'
++     geometry context and padding would clip them short of the viewport
++     bottom; and the flex-1 content column absorbs the inset, so the dock
++     (anchored bottom-0 of that column) stacks flush above the statusbar.
++     During a reveal the statusbar unmounts (controller.tsx suspendStatusbar)
++     and takes this margin with it, so the drawer spans full height and the
++     dock lift rule above takes over on the SAME baseline: change
++     --drawer-bottom-align and all three sites move in lockstep. The dock's
++     own keyboard padding (max(shell-pad, safe-bottom, keyboard-inset))
++     composes unchanged inside the box. Coarse only — fine pointers keep
++     margin 0, pixel-identical. */
++  [data-slot='statusbar'] {
++    margin-bottom: var(--drawer-bottom-align);
++  }
+ }
+ 
+ @keyframes narrow-drawer-in-left {

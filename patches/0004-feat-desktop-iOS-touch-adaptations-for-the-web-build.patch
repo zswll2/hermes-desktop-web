@@ -1,0 +1,205 @@
+From eb01f9b3010fe44e4e97ffdfb8142b30f220da2c Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 08:46:40 +0800
+Subject: [PATCH 04/32] feat(desktop): iOS/touch adaptations for the web build
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+viewport-fit=cover plus safe-area CSS vars; the composer's rich input sits at
+max(1rem, 16px) so iOS Safari never focus-zooms the viewport; the chat surface
+contains overscroll and buttons drop the double-tap-zoom delay via
+touch-action: manipulation. useVisualViewportInset mirrors the keyboard's
+occluded height into --keyboard-inset (iOS never resizes window.innerHeight)
+and the composer dock pads against it. The narrow-viewport pane overlay gains
+a backdrop + slide-in for PINNED reveals — the toggle-driven drawer touch
+needs, with an obvious tap-anywhere dismissal — while hover reveals keep
+their weightless behavior; desktop is unaffected (env() insets are 0,
+visualViewport matches the window).
+---
+ apps/desktop/index.html                       |  2 +-
+ .../chat/hooks/use-visual-viewport-inset.ts   | 36 +++++++++++
+ apps/desktop/src/app/chat/index.tsx           |  3 +
+ .../tree/renderer/narrow-overlays.tsx         | 13 ++++
+ apps/desktop/src/styles.css                   | 63 +++++++++++++++++++
+ 5 files changed, 116 insertions(+), 1 deletion(-)
+ create mode 100644 apps/desktop/src/app/chat/hooks/use-visual-viewport-inset.ts
+
+diff --git a/apps/desktop/index.html b/apps/desktop/index.html
+index afb14d768e..7b3a7c6323 100644
+--- a/apps/desktop/index.html
++++ b/apps/desktop/index.html
+@@ -2,7 +2,7 @@
+ <html lang="en">
+   <head>
+     <meta charset="UTF-8" />
+-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+     <meta name="color-scheme" content="light dark" />
+     <meta name="theme-color" content="#0a0a0a" />
+     <meta name="apple-mobile-web-app-capable" content="yes" />
+diff --git a/apps/desktop/src/app/chat/hooks/use-visual-viewport-inset.ts b/apps/desktop/src/app/chat/hooks/use-visual-viewport-inset.ts
+new file mode 100644
+index 0000000000..38f49d0549
+--- /dev/null
++++ b/apps/desktop/src/app/chat/hooks/use-visual-viewport-inset.ts
+@@ -0,0 +1,36 @@
++import { useEffect } from 'react'
++
++// iOS Safari never resizes window.innerHeight when the keyboard opens — it
++// shrinks window.visualViewport and scrolls it — so a bottom-docked composer
++// ends up under the keyboard. Mirror the occluded height into the
++// `--keyboard-inset` CSS var (consumed by [data-slot='composer-dock'] in
++// styles.css). Desktop Chromium has a visualViewport too, but it always
++// matches the window, so the inset stays 0 there.
++//
++// The var lives on <html> and is intentionally NOT cleared on unmount: every
++// ChatView (primary + tiles) computes the same value from the same source,
++// and a var left behind after the last surface unmounts is unread — the dock
++// selector only matches inside chat surfaces, and the next mount re-applies.
++export function useVisualViewportInset() {
++  useEffect(() => {
++    const viewport = window.visualViewport
++
++    if (!viewport) {
++      return
++    }
++
++    const apply = () => {
++      const occluded = Math.max(0, Math.round(window.innerHeight - viewport.offsetTop - viewport.height))
++      document.documentElement.style.setProperty('--keyboard-inset', `${occluded}px`)
++    }
++
++    viewport.addEventListener('resize', apply)
++    viewport.addEventListener('scroll', apply)
++    apply()
++
++    return () => {
++      viewport.removeEventListener('resize', apply)
++      viewport.removeEventListener('scroll', apply)
++    }
++  }, [])
++}
+diff --git a/apps/desktop/src/app/chat/index.tsx b/apps/desktop/src/app/chat/index.tsx
+index 1b95bc769a..b48db33340 100644
+--- a/apps/desktop/src/app/chat/index.tsx
++++ b/apps/desktop/src/app/chat/index.tsx
+@@ -65,6 +65,7 @@ import { ComposerSurfaceProvider, useComposerScope, useComposerSurfaceId } from
+ import type { ChatBarState } from './composer/types'
+ import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
+ import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
++import { useVisualViewportInset } from './hooks/use-visual-viewport-inset'
+ import { shouldShowIntro } from './intro-visibility'
+ import { ProfileTag } from './profile-tag'
+ import { isRouteSessionMismatch } from './route-session-state'
+@@ -488,6 +489,8 @@ const ChatViewContent = memo(function ChatViewContent({
+     migrateQueuedPrompts(selectedSessionId, queueSessionKey)
+   }, [queueSessionKey, selectedSessionId, sessions])
+ 
++  useVisualViewportInset()
++
+   // Transcript-side stops (the streaming message's hover Stop, the runtime's
+   // cancel) are explicit halts, same as the composer's Stop button: park any
+   // queued turns so the interrupt doesn't roll straight into the next one.
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+index 3f11c0e797..e7a414950f 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/narrow-overlays.tsx
+@@ -142,6 +142,18 @@ export function NarrowOverlays() {
+         />
+       ))}
+ 
++      {/* Backdrop for PINNED reveals only (titlebar toggle / ⌘B / touch):
++          hover reveals keep their weightless come-and-go, while a drawer the
++          user opened on purpose gets an obvious tap-anywhere-to-close target —
++          the only dismissal that works without a mouse. */}
++      {reveal?.pinned && revealed && (
++        <div
++          aria-hidden
++          className="absolute inset-0 z-30 bg-black/30"
++          onPointerDown={() => setReveal(null)}
++        />
++      )}
++
+       {revealed && (
+         <div
+           className={cn(
+@@ -154,6 +166,7 @@ export function NarrowOverlays() {
+           // panes beneath it — a see-through overlay reads as text bleeding
+           // through text. Contract: `[data-glass-opaque]` in styles.css.
+           data-glass-opaque=""
++          data-narrow-drawer={sideOf(revealed)}
+           onMouseLeave={() => setReveal(current => (current?.pinned ? current : null))}
+           // Match the pane's docked width (sessions ~237px, files its rail
+           // width) instead of a fat fixed 20rem — capped for tiny screens.
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index a06e8af50a..58e32c5226 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3530,3 +3530,66 @@ html:has([data-hud-shell]) [data-slot='popover-content'] {
+ [data-hud-shell] [data-slot='composer-bounds'] *::-webkit-scrollbar {
+   display: none;
+ }
++
++/* ── Touch / iOS viewport adaptations ──────────────────────────────────────
++   Neutral on desktop: env() safe-area insets are 0 outside notched devices,
++   the 16px input floor only matters to iOS Safari's focus-zoom heuristic,
++   and --keyboard-inset stays 0 where visualViewport matches the window. */
++:root {
++  --safe-top: env(safe-area-inset-top, 0px);
++  --safe-bottom: env(safe-area-inset-bottom, 0px);
++  --keyboard-inset: 0px;
++}
++
++html {
++  -webkit-text-size-adjust: 100%;
++}
++
++/* iOS Safari zooms the whole viewport when a focusable text surface is smaller
++   than 16px — the composer's rich input must sit at or above that floor. */
++[data-slot='composer-rich-input'] {
++  font-size: max(1rem, 16px);
++}
++
++/* Keep transcript scrolling contained: no whole-page rubber-banding past the
++   thread, and no double-tap-zoom delay on interactive controls. */
++[data-chat-surface] {
++  overscroll-behavior: contain;
++}
++
++button,
++[role='button'] {
++  touch-action: manipulation;
++}
++
++/* The composer dock clears the home indicator and the on-screen keyboard
++   (live var from use-visual-viewport-inset), not just its static shell pad. */
++[data-slot='composer-dock'] {
++  padding-bottom: max(var(--composer-shell-pad-block-end), var(--safe-bottom), var(--keyboard-inset));
++}
++
++/* Narrow-viewport drawer (session sidebar et al. below the collapse
++   breakpoint): clear the notch and slide in from its edge. */
++[data-narrow-drawer='left'] {
++  padding-top: var(--safe-top);
++  animation: narrow-drawer-in-left 160ms ease-out;
++}
++
++[data-narrow-drawer='right'] {
++  padding-top: var(--safe-top);
++  animation: narrow-drawer-in-right 160ms ease-out;
++}
++
++@keyframes narrow-drawer-in-left {
++  from {
++    opacity: 0.6;
++    transform: translateX(-4%);
++  }
++}
++
++@keyframes narrow-drawer-in-right {
++  from {
++    opacity: 0.6;
++    transform: translateX(4%);
++  }
++}

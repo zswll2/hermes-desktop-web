@@ -1,0 +1,83 @@
+From 3cc10bf05d2232d77081fe179a4da352044ef412 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 08:20:01 +0800
+Subject: [PATCH 01/32] =?UTF-8?q?feat(desktop):=20web=20build=20mode=20(--?=
+ =?UTF-8?q?mode=20web=20=E2=86=92=20dist-web)=20with=20dual-mode=20=5F=5FH?=
+ =?UTF-8?q?ERMES=5FWEB=5F=5F=20define?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+vite build --mode web emits the browser bundle to dist-web/ while the
+Electron build keeps dist/. __HERMES_WEB__ is defined in BOTH modes so the
+upcoming web-bridge install branch is dead-code-eliminated from Electron
+output (a bare identifier would throw ReferenceError at module top-level).
+---
+ .gitignore                     |  1 +
+ apps/desktop/package.json      |  1 +
+ apps/desktop/src/vite-env.d.ts |  3 +++
+ apps/desktop/vite.config.ts    | 10 +++++++++-
+ 4 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/.gitignore b/.gitignore
+index 7cf39fcfc9..dc4d59a254 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -86,6 +86,7 @@ hermes_cli/web_dist/
+ .web_ui_build.lock
+ apps/desktop/build/
+ apps/desktop/dist/
++apps/desktop/dist-web/
+ 
+ # tsc-emitted artifacts (a stray `tsc -b` compiles into src/, and vite then
+ # resolves the stale .js OVER the .tsx — never track these)
+diff --git a/apps/desktop/package.json b/apps/desktop/package.json
+index e83a1c7cfe..5c7c2b9041 100644
+--- a/apps/desktop/package.json
++++ b/apps/desktop/package.json
+@@ -29,6 +29,7 @@
+     "start": "npm run build && electron .",
+     "prebuild": "node scripts/assert-root-install.mjs && npm run clean",
+     "build": "node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && vite build && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps.mjs",
++    "build:web": "node scripts/write-build-stamp.mjs && vite build --mode web",
+     "postbuild": "node scripts/assert-dist-built.mjs",
+     "prebuilder": "node scripts/patch-electron-builder-mac-binary.mjs",
+     "builder": "cross-env NODE_OPTIONS=--max-old-space-size=16384 node scripts/run-electron-builder.mjs",
+diff --git a/apps/desktop/src/vite-env.d.ts b/apps/desktop/src/vite-env.d.ts
+index 11f02fe2a0..6fa453eeb7 100644
+--- a/apps/desktop/src/vite-env.d.ts
++++ b/apps/desktop/src/vite-env.d.ts
+@@ -1 +1,4 @@
+ /// <reference types="vite/client" />
++
++// Build-mode flag injected by vite `define` (both modes — see vite.config.ts).
++declare const __HERMES_WEB__: boolean
+diff --git a/apps/desktop/vite.config.ts b/apps/desktop/vite.config.ts
+index 52adcec8a5..54dffec62d 100644
+--- a/apps/desktop/vite.config.ts
++++ b/apps/desktop/vite.config.ts
+@@ -101,8 +101,14 @@ const emojibaseAssets = () => ({
+   }
+ })
+ 
+-export default defineConfig(({ command }) => ({
++export default defineConfig(({ command, mode }) => ({
+   base: './',
++  // Browser build (`vite build --mode web`) reuses this exact renderer source;
++  // `__HERMES_WEB__` must be defined in BOTH modes — the Electron build needs
++  // the `'false'` replacement so the web-bridge install branch becomes `if (false)`
++  // and is dead-code-eliminated (a bare identifier would throw ReferenceError at
++  // module top-level in the packaged app).
++  define: { __HERMES_WEB__: mode === 'web' ? 'true' : 'false' },
+   plugins: [react(), babel({ presets: [compilerPreset()] }), tailwindcss(), emojibaseAssets()],
+   css: {
+     // Pin an explicit (empty) PostCSS config. Tailwind is handled entirely by
+@@ -118,6 +124,8 @@ export default defineConfig(({ command }) => ({
+     postcss: { plugins: [] }
+   },
+   build: {
++    // web bundle (dist-web/) is served by the dashboard's /app mount; Electron keeps dist/.
++    outDir: mode === 'web' ? 'dist-web' : 'dist',
+     // The renderer intentionally ships FEW chunks (not one, not thousands):
+     //   · `codeSplitting: false` (the old setup) inlines every `lazy()` /
+     //     dynamic import into the entry, so heavyweight lazy-only deps

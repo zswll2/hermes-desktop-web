@@ -1,0 +1,233 @@
+From 58dfb71ceedbf00678622c6b2b45b1d3428a9eab Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 15:53:35 +0800
+Subject: [PATCH 09/32] fix(desktop): shell-root safe-area inset +
+ fixed-surface calc tops + toolbar/tab clearance
+
+F4b: [data-contrib-shell] becomes the single in-flow padding site for
+--safe-top (titlebar band, tree, and drawer containing block shift below
+the notch together; popout shell intentionally included); the drawers'
+and titlebar-chrome's own padding rules are removed to avoid
+double-counting. Fixed surfaces add var(--safe-top) to their top calcs:
+the three titlebar clusters, notifications, find-bar, overlay-view top
+inset, and floating-pane viewport clamp.
+
+F4e: the main transcript's top pad becomes
+max(var(--titlebar-height)-0.5rem, 0px) + var(--chat-top-gap) so the
+coarse-gated 6px gap (fine pointer: 0px, pixel-identical) survives the
+CSS negative-padding clamp the raw expression used to hit.
+
+User addendum A: coarse pointers get a 23px margin above zone tab strips
+(cluster bottom 49 + 8px breathing room - titlebar band 34), keeping
+44px toolbar targets clear of the first clickable tab row.
+---
+ .../desktop/src/app/overlays/overlay-view.tsx |  9 ++--
+ .../src/app/shell/titlebar-controls.tsx       |  9 ++--
+ .../components/assistant-ui/thread/list.tsx   |  6 ++-
+ apps/desktop/src/components/find-bar.tsx      |  2 +-
+ apps/desktop/src/components/notifications.tsx |  2 +-
+ .../tree/renderer/floating-panes.tsx          |  8 +++-
+ apps/desktop/src/styles.css                   | 48 ++++++++++++++-----
+ 7 files changed, 63 insertions(+), 21 deletions(-)
+
+diff --git a/apps/desktop/src/app/overlays/overlay-view.tsx b/apps/desktop/src/app/overlays/overlay-view.tsx
+index a3dd027ce1..ce90071a51 100644
+--- a/apps/desktop/src/app/overlays/overlay-view.tsx
++++ b/apps/desktop/src/app/overlays/overlay-view.tsx
+@@ -78,9 +78,12 @@ export function OverlayView({
+         // Equidistant inset on every side. The top value is driven by the
+         // titlebar height so the card clears the OS traffic-lights vertically;
+         // since the card top already sits below them, the left needs no extra
+-        // inset — keeping all sides equal so the card is ~full-width at any size.
+-        'p-[calc(var(--titlebar-height)+0.625rem)]',
+-        'sm:p-[calc(var(--titlebar-height)+0.875rem)]'
++        // inset — keeping all sides equal so the card is ~full-width at any
++        // size. The safe-area inset joins the top calc only (fixed surface,
++        // no ancestor padding); the drag-band semantics of
++        // --titlebar-height itself are unchanged.
++        'p-[calc(var(--titlebar-height)+var(--safe-top,0px)+0.625rem)]',
++        'sm:p-[calc(var(--titlebar-height)+var(--safe-top,0px)+0.875rem)]'
+       )}
+       // Every OverlayView-based overlay (settings, command-center, agents, cron,
+       // profiles, star map, …) covers the chat while the composer stays mounted
+diff --git a/apps/desktop/src/app/shell/titlebar-controls.tsx b/apps/desktop/src/app/shell/titlebar-controls.tsx
+index d5a19c42ac..3b21f3e327 100644
+--- a/apps/desktop/src/app/shell/titlebar-controls.tsx
++++ b/apps/desktop/src/app/shell/titlebar-controls.tsx
+@@ -274,7 +274,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
+         aria-label={t.shell.windowControls}
+         className={cn(
+           titlebarToolClusterClass,
+-          'left-(--titlebar-controls-left) top-(--titlebar-controls-top) translate-y-(--titlebar-controls-y-nudge)'
++          'left-(--titlebar-controls-left) top-[calc(var(--titlebar-controls-top)+var(--safe-top,0px))] translate-y-(--titlebar-controls-y-nudge)'
+         )}
+         data-slot="titlebar-chrome"
+       >
+@@ -298,7 +298,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
+           aria-label={t.shell.paneControls}
+           className={cn(
+             titlebarToolClusterClass,
+-            'top-[calc(var(--titlebar-controls-top)+var(--right-rail-top-inset,0px))] right-[calc(var(--titlebar-tools-right)+var(--shell-preview-toolbar-gap,0))]'
++            'top-[calc(var(--titlebar-controls-top)+var(--right-rail-top-inset,0px)+var(--safe-top,0px))] right-[calc(var(--titlebar-tools-right)+var(--shell-preview-toolbar-gap,0))]'
+           )}
+           data-slot="titlebar-chrome"
+         >
+@@ -310,7 +310,10 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
+ 
+       <div
+         aria-label={t.shell.appControls}
+-        className={cn(titlebarToolClusterClass, 'right-(--titlebar-tools-right) top-(--titlebar-controls-top)')}
++        className={cn(
++          titlebarToolClusterClass,
++          'right-(--titlebar-tools-right) top-[calc(var(--titlebar-controls-top)+var(--safe-top,0px))]'
++        )}
+         data-slot="titlebar-chrome"
+       >
+         {visibleSystemTools.map(tool => (
+diff --git a/apps/desktop/src/components/assistant-ui/thread/list.tsx b/apps/desktop/src/components/assistant-ui/thread/list.tsx
+index e43f10e864..71c5c5fa82 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/list.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/list.tsx
+@@ -610,7 +610,11 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
+ 
+   const threadContentTopPad = secondaryWindow
+     ? 'pt-[calc(var(--titlebar-height)+0.75rem)]'
+-    : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
++    : // Main shell pins --titlebar-height to 0px, so the raw expression goes
++      // negative and CSS clamps padding to 0 — max() keeps that baseline
++      // (fine pointer: 0, pixel-identical) while letting the coarse-gated
++      // --chat-top-gap (6px) actually take effect instead of being clamped away.
++      'pt-[calc(max(var(--titlebar-height)-0.5rem,0px)+var(--chat-top-gap,0px))]'
+ 
+   useEffect(() => publishThreadAtBottom(isAtBottom, { paneVisible }), [isAtBottom, paneVisible])
+   useEffect(() => () => resetPublishedThreadScroll({ paneVisible }), [paneVisible])
+diff --git a/apps/desktop/src/components/find-bar.tsx b/apps/desktop/src/components/find-bar.tsx
+index bdfcfce0c3..3e1ab0942a 100644
+--- a/apps/desktop/src/components/find-bar.tsx
++++ b/apps/desktop/src/components/find-bar.tsx
+@@ -289,7 +289,7 @@ export function FindBar() {
+         // floating-hud.ts / notifications.tsx) — a 0px fallback parks the bar
+         // inside the titlebar strip, underneath the native min/max/close
+         // window-controls overlay on Windows/Linux.
+-        'pointer-events-auto fixed right-4 top-[calc(var(--titlebar-height,34px)+0.5rem)] z-50',
++        'pointer-events-auto fixed right-4 top-[calc(var(--titlebar-height,34px)+var(--safe-top,0px)+0.5rem)] z-50',
+         'flex items-center gap-2 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) px-2 py-1.5 shadow-md'
+       )}
+       role="search"
+diff --git a/apps/desktop/src/components/notifications.tsx b/apps/desktop/src/components/notifications.tsx
+index e8a8dda8d6..60d91a2c01 100644
+--- a/apps/desktop/src/components/notifications.tsx
++++ b/apps/desktop/src/components/notifications.tsx
+@@ -119,7 +119,7 @@ function TopCenterStack({
+       aria-label={copy.region}
+       className={cn(
+         REGION_BASE,
+-        'left-1/2 top-[calc(var(--titlebar-height,34px)+0.75rem)] w-[min(40rem,calc(100%-2rem))] -translate-x-1/2 flex-col'
++        'left-1/2 top-[calc(var(--titlebar-height,34px)+var(--safe-top,0px)+0.75rem)] w-[min(40rem,calc(100%-2rem))] -translate-x-1/2 flex-col'
+       )}
+       role="region"
+     >
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/floating-panes.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/floating-panes.tsx
+index b4fea56fb7..66c3cce16b 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/floating-panes.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/floating-panes.tsx
+@@ -48,9 +48,15 @@ const readStored = (): Record<string, StoredRect> => readJson<Record<string, Sto
+ const viewportNow = (): FloatingViewport => ({
+   width: window.innerWidth,
+   height: window.innerHeight,
+-  top: TITLEBAR_HEIGHT
++  top: TITLEBAR_HEIGHT + safeTopPx()
+ })
+ 
++/** Live --safe-top in px (env() inset; 0 on desktops). Fixed cards clamp
++ *  against it because they don't ride the shell root's padding. */
++function safeTopPx(): number {
++  return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--safe-top')) || 0
++}
++
+ function FloatingPane({ pane }: { pane: Contribution }) {
+   const chrome = paneChrome(pane)
+   const anchor = chrome.anchor ?? 'top-right'
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index b19334cefd..278b0e122f 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3539,6 +3539,26 @@ html:has([data-hud-shell]) [data-slot='popover-content'] {
+   --safe-top: env(safe-area-inset-top, 0px);
+   --safe-bottom: env(safe-area-inset-bottom, 0px);
+   --keyboard-inset: 0px;
++  /* Coarse pointers add this much clearance below the in-flow titlebar for
++     the transcript's first bubble (thread/list.tsx top pad). Fine pointers
++     keep 0 — pixel-neutral. */
++  --chat-top-gap: 0px;
++}
++
++@media (pointer: coarse) {
++  :root {
++    --chat-top-gap: 6px;
++  }
++}
++
++/* The app shell root is the ONE in-flow padding site for the top safe area:
++   titlebar band, layout tree, and the narrow drawers' containing block all
++   shift below the notch together. Fixed surfaces opt in per-element with
++   calc(var(--safe-top)) instead (they don't ride ancestor padding). Applies
++   to the browser-popout shell too — the same page can be installed as a
++   PWA there. */
++[data-contrib-shell] {
++  padding-top: var(--safe-top);
+ }
+ 
+ html {
+@@ -3569,14 +3589,14 @@ button,
+ }
+ 
+ /* Narrow-viewport drawer (session sidebar et al. below the collapse
+-   breakpoint): clear the notch and slide in from its edge. */
++   breakpoint) slides in from its edge. No safe-area padding here: the
++   drawer's containing block already shifted below the notch via the
++   shell-root padding, so an extra inset would double it. */
+ [data-narrow-drawer='left'] {
+-  padding-top: var(--safe-top);
+   animation: narrow-drawer-in-left 160ms ease-out;
+ }
+ 
+ [data-narrow-drawer='right'] {
+-  padding-top: var(--safe-top);
+   animation: narrow-drawer-in-right 160ms ease-out;
+ }
+ 
+@@ -3594,14 +3614,10 @@ button,
+   }
+ }
+ 
+-/* Fixed titlebar tool clusters (left tools / pane tools / system tools) yield
+-   to the iOS status bar: `black-translucent` draws the page under it, so the
+-   cluster's children are pushed down by the safe-area inset. padding keeps the
+-   fixed element's own top offset (per-cluster `top` vars) intact and collapses
+-   to 0 on desktops, where env() reports no inset. */
+-[data-slot='titlebar-chrome'] {
+-  padding-top: var(--safe-top);
+-}
++/* Fixed titlebar tool clusters clear the iOS status bar through their
++   `top:` calc (titlebar-controls.tsx adds var(--safe-top) there). No
++   padding rule anymore — with the calc top it would double-count the
++   inset. */
+ 
+ /* Touch devices: titlebar icon buttons meet the 44px minimum touch target.
+    The glyph stays at its designed size — only the hit area grows. Coarse
+@@ -3618,4 +3634,14 @@ button,
+   [data-tree-edit-bar] button {
+     min-height: 44px;
+   }
++
++  /* Toolbar↔tab clearance: coarse clusters occupy y 5..49 (top 5 + 44px
++     targets) while zone tab strips start right below the 34px in-flow
++     titlebar band — a 15px overlap band that safe-area shifts move in
++     lockstep (padding + calc add the SAME var), so the overlap itself must
++     close here. 23px = cluster bottom 49 + 8px breathing room − band 34.
++     Fine pointers: no margin, pixel-identical to before. */
++  [data-zone-tabstrip] {
++    margin-top: 23px;
++  }
+ }

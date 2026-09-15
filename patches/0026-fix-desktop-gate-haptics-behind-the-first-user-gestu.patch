@@ -1,0 +1,138 @@
+From 5501c41f3839cf7beee5438e245bd05c335b864a Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 16:40:54 +0800
+Subject: [PATCH 26/32] fix(desktop): gate haptics behind the first user
+ gesture
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The startup-phase console error "Blocked call to navigator.vibrate
+because user hasn't tapped on the frame yet" came from our own haptics:
+web-haptics vibrates from any trigger, and intents fire before the first
+tap (streamStart on the first streamed token). triggerHaptic now stays
+suppressed until the first window pointerdown/touchstart. Accepted
+tradeoff, declared: this also silences a desktop trackpad tap-haptic
+before the user's first click — the same firing engines refuse; the
+first click re-opens the gate for everything after it.
+---
+ apps/desktop/src/lib/haptics.test.ts | 60 ++++++++++++++++++++++++++++
+ apps/desktop/src/lib/haptics.ts      | 31 +++++++++++++-
+ 2 files changed, 90 insertions(+), 1 deletion(-)
+ create mode 100644 apps/desktop/src/lib/haptics.test.ts
+
+diff --git a/apps/desktop/src/lib/haptics.test.ts b/apps/desktop/src/lib/haptics.test.ts
+new file mode 100644
+index 0000000000..9a955dd61e
+--- /dev/null
++++ b/apps/desktop/src/lib/haptics.test.ts
+@@ -0,0 +1,60 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import {
++  markUserGesture,
++  registerHapticTrigger,
++  resetHapticGestureGateForTests,
++  triggerHaptic,
++  type HapticTrigger
++} from './haptics'
++
++// The gesture gate exists for the engine rule behind "Blocked call to
++// navigator.vibrate because user hasn't tapped on the frame": web-haptics
++// vibrates from any trigger, so startup-phase intents (streamStart on the
++// first token) fired before the first tap. These tests pin the gate itself —
++// the E2E run stubs navigator.vibrate and counts real firings around a tap.
++describe('haptic first-gesture gate', () => {
++  const trigger: HapticTrigger = vi.fn(async () => undefined)
++
++  beforeEach(() => {
++    resetHapticGestureGateForTests()
++    registerHapticTrigger(trigger)
++    vi.mocked(trigger).mockClear()
++  })
++
++  afterEach(() => {
++    registerHapticTrigger(null)
++  })
++
++  it('suppresses every intent before the first user gesture', () => {
++    triggerHaptic('tap')
++    triggerHaptic('selection')
++    triggerHaptic('streamStart')
++
++    expect(trigger).not.toHaveBeenCalled()
++  })
++
++  it('opens the gate on the first window pointerdown', () => {
++    window.dispatchEvent(new Event('pointerdown'))
++
++    triggerHaptic('tap')
++
++    expect(trigger).toHaveBeenCalledTimes(1)
++  })
++
++  it('opens the gate on touchstart too (browsers without pointer events)', () => {
++    window.dispatchEvent(new Event('touchstart'))
++
++    triggerHaptic('close')
++
++    expect(trigger).toHaveBeenCalledTimes(1)
++  })
++
++  it('markUserGesture is an equivalent explicit source', () => {
++    markUserGesture()
++
++    triggerHaptic('open')
++
++    expect(trigger).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/apps/desktop/src/lib/haptics.ts b/apps/desktop/src/lib/haptics.ts
+index 83daf7bef0..26da1fde20 100644
+--- a/apps/desktop/src/lib/haptics.ts
++++ b/apps/desktop/src/lib/haptics.ts
+@@ -87,6 +87,35 @@ export type HapticTrigger = (input?: HapticInput, options?: TriggerOptions) => P
+ let registeredTrigger: HapticTrigger | null = null
+ let lastSelectionAt = 0
+ 
++// First-gesture gate. Engines reject navigator.vibrate until the user has
++// produced a gesture in the frame (WebKit logs "Blocked call to
++// navigator.vibrate because user hasn't tapped on the frame"), and web-haptics
++// vibrates from ANY trigger — including startup-phase intents that precede any
++// tap. Every intent stays suppressed until the first pointerdown/touchstart.
++// Accepted tradeoff: this also silences a desktop trackpad tap-haptic before
++// the user's first click — exactly the firing engines refuse anyway.
++let userGestured = false
++
++if (typeof window !== 'undefined') {
++  const markGestured = () => {
++    userGestured = true
++  }
++
++  window.addEventListener('pointerdown', markGestured, { capture: true })
++  window.addEventListener('touchstart', markGestured, { capture: true })
++}
++
++/** Open the gesture gate from an explicit gesture source (tests, or a host
++ * that observes activation elsewhere). */
++export function markUserGesture(): void {
++  userGestured = true
++}
++
++/** Reset the gesture gate between test assertions. */
++export function resetHapticGestureGateForTests(): void {
++  userGestured = false
++}
++
+ // Global rolling rate-limit. A runaway upstream loop (auth-expiry error-toast
+ // storms, reconnect flaps) can request dozens of haptics a second, which the
+ // trackpad actuator renders as a frantic "clickity" buzz. Cap firings to
+@@ -101,7 +130,7 @@ export function registerHapticTrigger(trigger: HapticTrigger | null) {
+ }
+ 
+ export function triggerHaptic(intent: HapticIntent = 'selection') {
+-  if ($hapticsMuted.get() || !registeredTrigger) {
++  if (!userGestured || $hapticsMuted.get() || !registeredTrigger) {
+     return
+   }
+ 

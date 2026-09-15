@@ -1,0 +1,68 @@
+From e38bded4cfa1641cec166cb1d1d8cee38c3dc575 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 16:25:15 +0800
+Subject: [PATCH 12/32] fix(desktop): coarse zone strip grows to 44px; collapse
+ button in-flow
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Live 390px Playwright audit follow-up: a 44px collapse button beside the
+tab overflows the ~105px grp-terminal zone — floating it under the strip
+hit the terminal pane's own tab list, and in-strip without room collided
+with the tab. The strip itself becomes the 44px touch row on coarse
+(labels truncate) so the trailing button fits with disjoint hit rects;
+the redundant 20px chevron hides where the button covers the same
+collapse path. A①/A② re-verified green at safe-top 0 and 59.
+---
+ .../components/pane-shell/tree/renderer/tree-group.tsx | 10 ++++++++--
+ apps/desktop/src/styles.css                            |  3 +++
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx b/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
+index 546e2c86ba..af30807dc2 100644
+--- a/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
++++ b/apps/desktop/src/components/pane-shell/tree/renderer/tree-group.tsx
+@@ -525,10 +525,16 @@ export function TreeGroup({
+             style={{ cursor: 'grab' }}
+             trailing={
+               <>
++                {/* Coarse collapse affordance for tool-panel zones (the
++                    terminal strip a thumb could not close): a 44px button in
++                    the trailing slot; the strip grows to 44px on coarse
++                    (styles.css) and the tab truncates, so hit rects stay
++                    disjoint. The 20px chevron is redundant HERE (both collapse
++                    through the same closer) and would collide — hidden. */}
+                 {coarse && isCollapsePane(activeId) && !node.minimized && (
+                   <button
+                     aria-label={t.common.close}
+-                    className="mr-1 grid size-11 shrink-0 place-items-center self-center rounded-md text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground"
++                    className="grid size-11 shrink-0 place-items-center self-stretch rounded-md text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground"
+                     data-zone-collapse={activeId}
+                     onClick={() => collapseTreePane(activeId)}
+                     onPointerDown={e => e.stopPropagation()}
+@@ -537,7 +543,7 @@ export function TreeGroup({
+                     <Codicon name="close" size="1rem" />
+                   </button>
+                 )}
+-                {minimizable && (
++                {minimizable && !(coarse && isCollapsePane(activeId)) && (
+                   <button
+                     aria-label={node.minimized ? t.zones.restore : t.zones.minimize}
+                     className="mx-1 grid size-5 shrink-0 place-items-center self-center rounded-md text-(--ui-text-tertiary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground focus-visible:opacity-100 group-hover/pane-header:opacity-100"
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index 278b0e122f..eba4d3db66 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -3640,8 +3640,11 @@ button,
+      titlebar band — a 15px overlap band that safe-area shifts move in
+      lockstep (padding + calc add the SAME var), so the overlap itself must
+      close here. 23px = cluster bottom 49 + 8px breathing room − band 34.
++     The strip also grows to a 44px touch row (labels truncate) so its own
++     trailing controls reach touch size without overlapping the tabs.
+      Fine pointers: no margin, pixel-identical to before. */
+   [data-zone-tabstrip] {
+     margin-top: 23px;
++    min-height: 44px;
+   }
+ }

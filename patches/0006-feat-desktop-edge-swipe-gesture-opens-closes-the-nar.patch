@@ -1,0 +1,296 @@
+From 6bd1ccd07abfa218170190ca76e09bde5545b234 Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 12:02:05 +0800
+Subject: [PATCH 06/32] feat(desktop): edge-swipe gesture opens/closes the
+ narrow-viewport drawer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+No touch gesture existed anywhere in the app — on a phone the collapsed
+session sidebar was reachable only through the 44px titlebar button.
+
+- classifyEdgeSwipe(): pure threshold contract (start x<=24, |dy|<=40,
+  |dx|>=60; close is direction-gated on the open drawer) with boundary
+  unit tests at every threshold edge
+- useEdgeSwipeDrawer(): document-level pure-observer listeners — all
+  passive, never preventDefault, so the transcript's own scroll is never
+  fought; gated on SIDEBAR_COLLAPSE_MEDIA_QUERY so desktop sees zero
+  behavior; a second finger (pinch) invalidates the gesture
+- gesture input is the drawer's VISIBILITY (the overlay's rendered node),
+  not the pane's open flag — the flag defaults true while the narrow
+  drawer is hidden, which would neuter every open swipe (found in E2E)
+- state changes flow only through store/layout's setSidebarOpen
+---
+ .../app/chat/hooks/use-edge-swipe-drawer.ts   | 98 +++++++++++++++++++
+ apps/desktop/src/app/chat/index.tsx           |  2 +
+ apps/desktop/src/lib/edge-swipe.test.ts       | 72 ++++++++++++++
+ apps/desktop/src/lib/edge-swipe.ts            | 55 +++++++++++
+ 4 files changed, 227 insertions(+)
+ create mode 100644 apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts
+ create mode 100644 apps/desktop/src/lib/edge-swipe.test.ts
+ create mode 100644 apps/desktop/src/lib/edge-swipe.ts
+
+diff --git a/apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts b/apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts
+new file mode 100644
+index 0000000000..752fcc9a44
+--- /dev/null
++++ b/apps/desktop/src/app/chat/hooks/use-edge-swipe-drawer.ts
+@@ -0,0 +1,98 @@
++import { useEffect } from 'react'
++
++import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
++import { matchesQuery } from '@/hooks/use-media-query'
++import { classifyEdgeSwipe } from '@/lib/edge-swipe'
++import { setSidebarOpen } from '@/store/layout'
++
++interface TrackedTouch {
++  identifier: number
++  startX: number
++  startY: number
++}
++
++// The narrow drawer's reveal state is LOCAL to the overlay component (it
++// never lives in the layout store), so its rendered node is the only honest
++// visibility signal — the pane's `open` flag defaults to true and stays true
++// while the drawer is hidden, which would make every "open" swipe a no-op.
++function narrowDrawerVisible(): boolean {
++  return Boolean(document.querySelector("[data-narrow-drawer='left']"))
++}
++
++/**
++ * Edge-swipe drawer gesture for narrow viewports.
++ *
++ * Registration is pinned to pure observation: touchstart/touchend listeners
++ * are `passive: true` and NOTHING ever calls `preventDefault()` — a passive
++ * listener cannot cancel scrolling anyway, and cancelling would fight the
++ * transcript's own scroll. The gesture is classified once, on touchend, by the
++ * pure `classifyEdgeSwipe` contract; only then does it touch drawer state,
++ * through the same setSidebarOpen the titlebar button uses.
++ *
++ * Desktop is untouched twice over: the handler returns early unless the
++ * sidebar-collapse media query matches, and touch events never fire for a
++ * mouse. A second finger landing mid-gesture invalidates it (pinch-zoom must
++ * not toggle the drawer).
++ */
++export function useEdgeSwipeDrawer(): void {
++  useEffect(() => {
++    let tracked: TrackedTouch | null = null
++
++    const onTouchStart = (event: TouchEvent) => {
++      if (event.touches.length > 1) {
++        tracked = null
++
++        return
++      }
++
++      const touch = event.touches[0]
++
++      if (!touch) {
++        return
++      }
++
++      tracked = { identifier: touch.identifier, startX: touch.clientX, startY: touch.clientY }
++    }
++
++    const onTouchEnd = (event: TouchEvent) => {
++      const start = tracked
++
++      tracked = null
++
++      if (!start || !matchesQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)) {
++        return
++      }
++
++      const touch = [...event.changedTouches].find(candidate => candidate.identifier === start.identifier)
++
++      if (!touch) {
++        return
++      }
++
++      const gesture = classifyEdgeSwipe({
++        dx: touch.clientX - start.startX,
++        dy: touch.clientY - start.startY,
++        startX: start.startX,
++        open: narrowDrawerVisible()
++      })
++
++      if (gesture) {
++        setSidebarOpen(gesture === 'open')
++      }
++    }
++
++    const onTouchCancel = () => {
++      tracked = null
++    }
++
++    document.addEventListener('touchstart', onTouchStart, { passive: true })
++    document.addEventListener('touchend', onTouchEnd, { passive: true })
++    document.addEventListener('touchcancel', onTouchCancel, { passive: true })
++
++    return () => {
++      document.removeEventListener('touchstart', onTouchStart)
++      document.removeEventListener('touchend', onTouchEnd)
++      document.removeEventListener('touchcancel', onTouchCancel)
++    }
++  }, [])
++}
+diff --git a/apps/desktop/src/app/chat/index.tsx b/apps/desktop/src/app/chat/index.tsx
+index b48db33340..53eb0136b8 100644
+--- a/apps/desktop/src/app/chat/index.tsx
++++ b/apps/desktop/src/app/chat/index.tsx
+@@ -64,6 +64,7 @@ import { droppedFileInlineRefs } from './composer/inline-refs'
+ import { ComposerSurfaceProvider, useComposerScope, useComposerSurfaceId } from './composer/scope'
+ import type { ChatBarState } from './composer/types'
+ import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
++import { useEdgeSwipeDrawer } from './hooks/use-edge-swipe-drawer'
+ import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
+ import { useVisualViewportInset } from './hooks/use-visual-viewport-inset'
+ import { shouldShowIntro } from './intro-visibility'
+@@ -490,6 +491,7 @@ const ChatViewContent = memo(function ChatViewContent({
+   }, [queueSessionKey, selectedSessionId, sessions])
+ 
+   useVisualViewportInset()
++  useEdgeSwipeDrawer()
+ 
+   // Transcript-side stops (the streaming message's hover Stop, the runtime's
+   // cancel) are explicit halts, same as the composer's Stop button: park any
+diff --git a/apps/desktop/src/lib/edge-swipe.test.ts b/apps/desktop/src/lib/edge-swipe.test.ts
+new file mode 100644
+index 0000000000..540fab4911
+--- /dev/null
++++ b/apps/desktop/src/lib/edge-swipe.test.ts
+@@ -0,0 +1,72 @@
++import { describe, expect, it } from 'vitest'
++
++import {
++  classifyEdgeSwipe,
++  EDGE_SWIPE_MAX_ABS_DY_PX,
++  EDGE_SWIPE_MIN_DX_PX,
++  EDGE_SWIPE_START_MAX_X_PX
++} from './edge-swipe'
++
++describe('classifyEdgeSwipe', () => {
++  describe('opening (drawer closed)', () => {
++    it('opens on a rightward swipe from the left edge', () => {
++      expect(classifyEdgeSwipe({ dx: 200, dy: 5, startX: 2, open: false })).toBe('open')
++    })
++
++    it('opens at exactly the minimum travel', () => {
++      expect(classifyEdgeSwipe({ dx: EDGE_SWIPE_MIN_DX_PX, dy: 0, startX: 0, open: false })).toBe('open')
++    })
++
++    it('rejects one pixel short of the minimum travel', () => {
++      expect(classifyEdgeSwipe({ dx: EDGE_SWIPE_MIN_DX_PX - 1, dy: 0, startX: 0, open: false })).toBeNull()
++    })
++
++    it('accepts a start at the edge-band boundary', () => {
++      expect(classifyEdgeSwipe({ dx: 100, dy: 0, startX: EDGE_SWIPE_START_MAX_X_PX, open: false })).toBe('open')
++    })
++
++    it('rejects a start one pixel past the edge band', () => {
++      expect(classifyEdgeSwipe({ dx: 100, dy: 0, startX: EDGE_SWIPE_START_MAX_X_PX + 1, open: false })).toBeNull()
++    })
++
++    it('rejects a leftward swipe from the edge', () => {
++      expect(classifyEdgeSwipe({ dx: -100, dy: 0, startX: 2, open: false })).toBeNull()
++    })
++  })
++
++  describe('closing (drawer open)', () => {
++    it('closes on a leftward swipe starting anywhere on the drawer', () => {
++      expect(classifyEdgeSwipe({ dx: -200, dy: -3, startX: 300, open: true })).toBe('close')
++    })
++
++    it('closes at exactly the minimum travel', () => {
++      expect(classifyEdgeSwipe({ dx: -EDGE_SWIPE_MIN_DX_PX, dy: 0, startX: 300, open: true })).toBe('close')
++    })
++
++    it('rejects one pixel short of the minimum travel', () => {
++      expect(classifyEdgeSwipe({ dx: -(EDGE_SWIPE_MIN_DX_PX - 1), dy: 0, startX: 300, open: true })).toBeNull()
++    })
++
++    it('ignores a further rightward swipe while open', () => {
++      expect(classifyEdgeSwipe({ dx: 120, dy: 0, startX: 2, open: true })).toBeNull()
++    })
++  })
++
++  describe('vertical drift gate', () => {
++    it('allows drift at the boundary', () => {
++      expect(classifyEdgeSwipe({ dx: 120, dy: EDGE_SWIPE_MAX_ABS_DY_PX, startX: 2, open: false })).toBe('open')
++      expect(classifyEdgeSwipe({ dx: 120, dy: -EDGE_SWIPE_MAX_ABS_DY_PX, startX: 2, open: false })).toBe('open')
++    })
++
++    it('rejects one pixel past the drift boundary (a scroll)', () => {
++      expect(classifyEdgeSwipe({ dx: 120, dy: EDGE_SWIPE_MAX_ABS_DY_PX + 1, startX: 2, open: false })).toBeNull()
++      expect(classifyEdgeSwipe({ dx: -120, dy: -(EDGE_SWIPE_MAX_ABS_DY_PX + 1), startX: 300, open: true })).toBeNull()
++    })
++  })
++
++  it('keeps thresholds on the contract the hook depends on', () => {
++    expect(EDGE_SWIPE_START_MAX_X_PX).toBe(24)
++    expect(EDGE_SWIPE_MIN_DX_PX).toBe(60)
++    expect(EDGE_SWIPE_MAX_ABS_DY_PX).toBe(40)
++  })
++})
+diff --git a/apps/desktop/src/lib/edge-swipe.ts b/apps/desktop/src/lib/edge-swipe.ts
+new file mode 100644
+index 0000000000..d5324f6eca
+--- /dev/null
++++ b/apps/desktop/src/lib/edge-swipe.ts
+@@ -0,0 +1,55 @@
++// Edge-swipe classification for the narrow-viewport drawer gesture.
++//
++// Pure arithmetic on the gesture's start point and total delta — no DOM, no
++// state — so the threshold contract is unit-testable in isolation. The hook
++// (app/chat/hooks/use-edge-swipe-drawer.ts) owns only the event plumbing.
++
++/** A gesture starting further from the left edge than this is not an
++ *  edge-swipe (iOS reserves roughly this band for the system gesture). */
++export const EDGE_SWIPE_START_MAX_X_PX = 24
++
++/** Minimum horizontal travel before a gesture counts as a swipe. */
++export const EDGE_SWIPE_MIN_DX_PX = 60
++
++/** Vertical drift above which a gesture is a scroll, not a swipe. */
++export const EDGE_SWIPE_MAX_ABS_DY_PX = 40
++
++export interface EdgeSwipeInput {
++  /** Horizontal travel: endX - startX, positive → rightward. */
++  dx: number
++  /** Vertical drift: endY - startY. */
++  dy: number
++  /** Gesture start X in viewport coordinates. */
++  startX: number
++  /** Whether the drawer the gesture controls is currently open. */
++  open: boolean
++}
++
++export type EdgeSwipeResult = 'close' | 'open' | null
++
++/**
++ * Classify one completed touch gesture against the drawer thresholds.
++ *
++ * - Drawer closed: only a rightward swipe STARTING within the edge band opens
++ *   it, so mid-screen horizontal drags (slider UIs, text selection) never
++ *   summon the drawer.
++ * - Drawer open: a leftward swipe from anywhere closes it — the drawer itself
++ *   covers the screen edge, so every close gesture necessarily starts on it.
++ * - Anything else — too short, too diagonal, or a repeat of the current state
++ *   — is `null` and must not touch drawer state.
++ */
++export function classifyEdgeSwipe({ dx, dy, startX, open }: EdgeSwipeInput): EdgeSwipeResult {
++  if (Math.abs(dy) > EDGE_SWIPE_MAX_ABS_DY_PX) {
++    return null
++  }
++
++  if (open) {
++    return dx <= -EDGE_SWIPE_MIN_DX_PX ? 'close' : null
++  }
++
++  if (startX > EDGE_SWIPE_START_MAX_X_PX) {
++    return null
++  }
++
++  return dx >= EDGE_SWIPE_MIN_DX_PX ? 'open' : null
++}

@@ -1,0 +1,509 @@
+From 6d033f9db9870f16c31b2f4a4a55601a1cd35f2d Mon Sep 17 00:00:00 2001
+From: zswll2 <zswll2@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 12:02:05 +0800
+Subject: [PATCH 07/32] fix(desktop): browser attachments via a web file
+ registry + data_url-only file.attach
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Attachments were fully broken in the web build: selectPaths rejected,
+getPathForFile returned '' (so non-image drops produced no chip), images
+needed saveImageBuffer, and api.upload refused outright. The renderer's
+attach pipeline is path-keyed, so the fix lands at the bridge seam:
+
+- web-file-registry: browser Files/blobs get stable virtual paths
+  (/__webfs__/<id>/<name>); pure module, empty and inert under Electron
+- web bridge: selectPaths drives one persistent hidden file input
+  (directories reject honestly), getPathForFile/saveImageBuffer register
+  bytes, readFileDataUrl resolves registry paths before the fs REST
+  fallback — picks, drops, previews, and clipboard-pasted images all work
+- uploadComposerAttachment: virtual paths are gateway-invisible, so
+  file.attach sends {name, data_url, session_id} with NO path; the
+  backend stages the bytes from data_url alone
+- webApi: api.upload implemented with FormData (browser-owned multipart
+  boundary), POST default, same auth/error mapping
+
+Tests: registry round-trip + fall-through, upload FormData shape, and the
+file.attach no-path contract for browser-picked files.
+---
+ .../hooks/use-prompt-actions/index.test.tsx   |  41 ++++++
+ .../session/hooks/use-prompt-actions/index.ts |   5 +-
+ .../desktop/src/lib/bridge/web-bridge.test.ts | 102 ++++++++++++-
+ apps/desktop/src/lib/bridge/web-bridge.ts     | 139 +++++++++++++++---
+ .../src/lib/bridge/web-file-registry.ts       |  85 +++++++++++
+ 5 files changed, 347 insertions(+), 25 deletions(-)
+ create mode 100644 apps/desktop/src/lib/bridge/web-file-registry.ts
+
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
+index 0673798c18..51f48a61d9 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
+@@ -3009,6 +3009,47 @@ describe('usePromptActions file attachment sync', () => {
+     expect(uploaded.path).toBe('/root/tmp/photo.jpg')
+   })
+ 
++  it('sends browser-picked files as data_url with NO path (virtual paths are gateway-invisible)', async () => {
++    const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,aGVsbG8=')
++    Object.defineProperty(window, 'hermesDesktop', {
++      configurable: true,
++      value: { readFileDataUrl }
++    })
++
++    const requestGateway = vi.fn(async (method: string, _params?: unknown) => {
++      if (method === 'file.attach') {
++        return { attached: true, ref_text: '@file:notes.txt' } as never
++      }
++
++      return {} as never
++    })
++
++    const virtualPath = '/__webfs__/1/notes.txt'
++
++    const uploaded = await uploadComposerAttachment(
++      {
++        id: 'file:notes.txt',
++        kind: 'file',
++        label: 'notes.txt',
++        path: virtualPath,
++        refText: '@file:notes.txt'
++      },
++      {
++        remote: true,
++        requestGateway,
++        sessionId: RUNTIME_SESSION_ID
++      }
++    )
++
++    expect(readFileDataUrl).toHaveBeenCalledWith(virtualPath)
++    const attachCall = requestGateway.mock.calls.find(([method]) => method === 'file.attach')
++    expect(attachCall).toBeDefined()
++    const params = (attachCall?.[1] ?? {}) as Record<string, unknown>
++    expect(params).toMatchObject({ name: 'notes.txt', session_id: RUNTIME_SESSION_ID, data_url: 'data:text/plain;base64,aGVsbG8=' })
++    expect(params).not.toHaveProperty('path')
++    expect(uploaded.refText).toBe('@file:notes.txt')
++  })
++
+   it('merges image staging into the current occurrence without dropping its thumbnail', async () => {
+     $connection.set({ mode: 'local' } as never)
+     $currentCwd.set('/root')
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts
+index b82d28c015..0009b3b770 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/index.ts
+@@ -6,6 +6,7 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
+ import { transcribeAudio } from '@/hermes'
+ import { useI18n } from '@/i18n'
+ import { stripAnsi } from '@/lib/ansi'
++import { isWebVirtualPath } from '@/lib/bridge/web-file-registry'
+ import { type ChatMessage, textPart } from '@/lib/chat-messages'
+ import { pathLabel, SLASH_COMMAND_RE } from '@/lib/chat-runtime'
+ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+@@ -190,7 +191,9 @@ export async function uploadComposerAttachment(
+ 
+     const result = await requestGateway<FileAttachResponse>('file.attach', {
+       name: label,
+-      path,
++      // Virtual web-registry paths don't exist on the gateway; bytes arrive
++      // as data_url and the backend stages them from `name` alone.
++      ...(isWebVirtualPath(path) ? {} : { path }),
+       session_id: liveSessionId,
+       ...(fileDataUrl ? { data_url: fileDataUrl } : {})
+     })
+diff --git a/apps/desktop/src/lib/bridge/web-bridge.test.ts b/apps/desktop/src/lib/bridge/web-bridge.test.ts
+index 97b1f8d4fa..80293b8e43 100644
+--- a/apps/desktop/src/lib/bridge/web-bridge.test.ts
++++ b/apps/desktop/src/lib/bridge/web-bridge.test.ts
+@@ -1,6 +1,7 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { createWebBridge, WebApiAuthError, WebApiError, WebBridgeCapabilityError } from './web-bridge'
++import { isWebVirtualPath, registerWebFile, resetWebFileRegistry, WEB_FS_ROOT } from './web-file-registry'
+ 
+ import { getBridge } from './index'
+ 
+@@ -100,11 +101,104 @@ describe('web-bridge api()', () => {
+     expect((error as WebApiError).status).toBe(500)
+   })
+ 
+-  it('multipart upload requests reject with a capability error (out of P0 scope)', async () => {
++  it('multipart uploads POST FormData with the browser-set boundary (no content-type header)', async () => {
++    const fn = mockFetch(200, { saved: true })
+     const bridge = createWebBridge()
+-    await expect(
+-      bridge.api({ path: '/api/upload', upload: { filename: 'a.png', bytes: new ArrayBuffer(1) } })
+-    ).rejects.toBeInstanceOf(WebBridgeCapabilityError)
++    const bytes = new TextEncoder().encode('file-bytes')
++
++    const result = await bridge.api<{ saved: boolean }>({
++      path: '/api/plugins/kanban/upload',
++      upload: { filename: 'board.png', contentType: 'image/png', bytes: bytes.buffer as ArrayBuffer }
++    })
++
++    const [url, init] = authedFetchCall(fn)
++    expect(url).toBe('/api/plugins/kanban/upload')
++    expect(init.method).toBe('POST')
++    expect(init.body).toBeInstanceOf(FormData)
++    const entries = [...(init.body as FormData).entries()]
++    const [fieldName, formValue] = entries.find(([name]) => name === 'file') ?? []
++    expect(fieldName).toBe('file')
++    expect((formValue as File).name).toBe('board.png')
++    expect((formValue as File).type).toBe('image/png')
++    expect(new Headers(init.headers).get('content-type')).toBeNull()
++    expect(init.credentials).toBe('same-origin')
++    expect(result).toEqual({ saved: true })
++  })
++
++  it('an explicit GET with an upload is a caller bug, not a silent body drop', async () => {
++    const bridge = createWebBridge()
++
++    const error = await bridge
++      .api({ path: '/api/x', method: 'GET', upload: { filename: 'a.png', bytes: new ArrayBuffer(1) } })
++      .catch((e: unknown) => e)
++
++    expect(error).toBeInstanceOf(WebApiError)
++    expect((error as WebApiError).status).toBe(400)
++  })
++})
++
++describe('web-bridge browser file registry', () => {
++  beforeEach(() => {
++    resetWebFileRegistry()
++  })
++
++  it('getPathForFile mints a memoized virtual path for a browser File', () => {
++    const bridge = createWebBridge()
++    const file = new File(['hello'], 'note.txt', { type: 'text/plain' })
++    const first = bridge.getPathForFile(file)
++    expect(isWebVirtualPath(first)).toBe(true)
++    expect(first).toContain('note.txt')
++    expect(bridge.getPathForFile(file)).toBe(first)
++    expect(bridge.getPathForFile(new File(['x'], 'other.txt'))).not.toBe(first)
++  })
++
++  it('readFileDataUrl serves registered files as data URLs without any fetch', async () => {
++    const fn = mockFetch(200, {})
++    const bridge = createWebBridge()
++    const path = registerWebFile(new File(['hi'], 'a.txt', { type: 'text/plain' }))
++    const dataUrl = await bridge.readFileDataUrl(path)
++    expect(dataUrl.startsWith('data:text/plain;base64,')).toBe(true)
++    expect(atob(dataUrl.split(',')[1] || '')).toBe('hi')
++    expect(fn).not.toHaveBeenCalled()
++  })
++
++  it('readFileDataUrl falls through to the REST endpoint for non-virtual paths', async () => {
++    const fn = mockFetch(200, { dataUrl: 'data:image/png;base64,QQ==' })
++    const bridge = createWebBridge()
++    const dataUrl = await bridge.readFileDataUrl('/srv/real/shot.png')
++    expect(dataUrl).toBe('data:image/png;base64,QQ==')
++    const [url] = authedFetchCall(fn)
++    expect(url).toBe(`/api/fs/read-data-url?path=${encodeURIComponent('/srv/real/shot.png')}`)
++  })
++
++  it('saveImageBuffer registers bytes under a readable virtual path', async () => {
++    const bridge = createWebBridge()
++    const bytes = new TextEncoder().encode('pngbytes')
++    const path = await bridge.saveImageBuffer(bytes, '.png', 'dropped.png')
++    expect(isWebVirtualPath(path)).toBe(true)
++    const dataUrl = await bridge.readFileDataUrl(path)
++    expect(dataUrl.startsWith('data:')).toBe(true)
++    expect(atob(dataUrl.split(',')[1] || '')).toBe('pngbytes')
++  })
++
++  it('saveImageBuffer defaults the name from the extension when unnamed', async () => {
++    const bridge = createWebBridge()
++    const path = await bridge.saveImageBuffer(new Uint8Array([1]), 'png')
++    expect(path.endsWith('/attachment.png')).toBe(true)
++  })
++
++  it('selectPaths rejects directory picks honestly (no browser directory picker)', async () => {
++    const bridge = createWebBridge()
++    const error = await bridge.selectPaths({ directories: true }).catch((e: unknown) => e)
++    expect(error).toBeInstanceOf(WebBridgeCapabilityError)
++    expect((error as WebBridgeCapabilityError).capability).toBe('selectPaths.directories')
++  })
++
++  it('virtual paths live under the reserved root and never collide with real ones', () => {
++    expect(isWebVirtualPath(`${WEB_FS_ROOT}/1/a.txt`)).toBe(true)
++    expect(isWebVirtualPath('/home/user/a.txt')).toBe(false)
++    expect(isWebVirtualPath('')).toBe(false)
++    expect(isWebVirtualPath(undefined)).toBe(false)
+   })
+ })
+ 
+diff --git a/apps/desktop/src/lib/bridge/web-bridge.ts b/apps/desktop/src/lib/bridge/web-bridge.ts
+index cad6613b44..480ff3680d 100644
+--- a/apps/desktop/src/lib/bridge/web-bridge.ts
++++ b/apps/desktop/src/lib/bridge/web-bridge.ts
+@@ -10,7 +10,9 @@
+ // with `WebBridgeCapabilityError` instead of silently returning undefined.
+ import { buildHermesWebSocketUrl, type GatewayWsUrlResult, type WebSocketAuthParam } from '@hermes/shared'
+ 
+-import type { HermesApiRequest, HermesConnection } from '@/global'
++import type { HermesApiRequest, HermesConnection, HermesSelectPathsOptions } from '@/global'
++
++import { readWebFileDataUrl, registerWebBlob, registerWebFile } from './web-file-registry'
+ 
+ export class WebBridgeCapabilityError extends Error {
+   readonly capability: string
+@@ -96,23 +98,46 @@ function withProfileParam(path: string, profile?: string | null): string {
+   return `${path}${sep}profile=${encodeURIComponent(profile)}`
+ }
+ 
++// Multipart body for HermesApiRequest.upload. FormData lets the browser set
++// the multipart boundary itself — hand-building one is the classic corruption
++// bug. No content-type header: fetch derives it (with boundary) from the body.
++function uploadFormData(upload: NonNullable<HermesApiRequest['upload']>): FormData {
++  const form = new FormData()
++
++  form.append('file', new Blob([upload.bytes], { type: upload.contentType || 'application/octet-stream' }), upload.filename)
++
++  return form
++}
++
+ async function webApi<T>(request: HermesApiRequest): Promise<T> {
+-  if (request.upload) {
+-    warnOnce('api.upload')
++  // pluginRest sends uploads without an explicit method — a multipart body
++  // implies POST.
++  const method = (request.upload ? request.method ?? 'POST' : request.method ?? 'GET').toUpperCase()
++  const upload = request.upload
+ 
+-    return Promise.reject(new WebBridgeCapabilityError('api.upload'))
++  if (upload && (method === 'GET' || method === 'HEAD')) {
++    throw new WebApiError(400, 'upload requires a body-bearing method')
+   }
+ 
+-  const method = (request.method ?? 'GET').toUpperCase()
+-  const hasBody = request.body !== undefined && method !== 'GET' && method !== 'HEAD'
+-
+-  const res = await fetch(withProfileParam(request.path, request.profile), {
+-    method,
+-    headers: authHeaders(hasBody),
+-    body: hasBody ? JSON.stringify(request.body) : undefined,
+-    credentials: 'same-origin',
+-    signal: request.timeoutMs ? AbortSignal.timeout(request.timeoutMs) : undefined
+-  })
++  const jsonBody = !upload && request.body !== undefined && method !== 'GET' && method !== 'HEAD'
++
++  const init: RequestInit = upload
++    ? {
++        method,
++        headers: authHeaders(false),
++        body: uploadFormData(upload),
++        credentials: 'same-origin',
++        signal: request.timeoutMs ? AbortSignal.timeout(request.timeoutMs) : undefined
++      }
++    : {
++        method,
++        headers: authHeaders(jsonBody),
++        body: jsonBody ? JSON.stringify(request.body) : undefined,
++        credentials: 'same-origin',
++        signal: request.timeoutMs ? AbortSignal.timeout(request.timeoutMs) : undefined
++      }
++
++  const res = await fetch(withProfileParam(request.path, request.profile), init)
+ 
+   if (res.status === 401 || res.status === 403) {
+     throw new WebApiAuthError(res.status, `${res.status}: ${await res.text().catch(() => res.statusText)}`)
+@@ -184,9 +209,15 @@ async function webGetConnection(_profile?: null | string): Promise<HermesConnect
+   }
+ }
+ 
+-// Fallback for direct `readFileDataUrl` call sites; the remote branch of
+-// desktop-fs.ts (media rendering) goes through `api()` instead.
++// Registry-first: browser-picked files resolve from the in-tab registry;
++// real backend paths fall through to the remote fs REST endpoint.
+ async function webReadFileDataUrl(path: string): Promise<string> {
++  const webFile = await readWebFileDataUrl(path)
++
++  if (webFile) {
++    return webFile
++  }
++
+   const res = await fetch(withProfileParam(`/api/fs/read-data-url?path=${encodeURIComponent(path)}`), {
+     headers: authHeaders(false),
+     credentials: 'same-origin'
+@@ -198,6 +229,74 @@ async function webReadFileDataUrl(path: string): Promise<string> {
+   return typeof data === 'string' ? data : (data.dataUrl ?? '')
+ }
+ 
++// One long-lived hidden input serves every pick; on-demand creation+removal
++// would race Playwright/automation and re-picks mid-frame.
++const FILE_INPUT_TEST_ID = 'web-bridge-file-input'
++
++let sharedFileInput: HTMLInputElement | null = null
++let pendingPick: null | (() => void) = null
++
++function sharedPickerInput(accept: string, multiple: boolean): HTMLInputElement {
++  if (!sharedFileInput) {
++    const input = document.createElement('input')
++
++    input.type = 'file'
++    input.hidden = true
++    input.dataset.testid = FILE_INPUT_TEST_ID
++    input.addEventListener('cancel', () => pendingPick?.())
++    input.addEventListener('change', () => pendingPick?.())
++    document.body.appendChild(input)
++    sharedFileInput = input
++  }
++
++  // Reset value so picking the same file twice still fires `change`.
++  sharedFileInput.value = ''
++  sharedFileInput.accept = accept
++  sharedFileInput.multiple = multiple
++
++  return sharedFileInput
++}
++
++async function webSelectPaths(options?: HermesSelectPathsOptions): Promise<string[]> {
++  if (options?.directories) {
++    warnOnce('selectPaths.directories')
++
++    return Promise.reject(new WebBridgeCapabilityError('selectPaths.directories'))
++  }
++
++  const accept = (options?.filters || [])
++    .flatMap(filter => filter.extensions.map(extension => `.${extension.replace(/^\./, '')}`))
++    .join(',')
++
++  const input = sharedPickerInput(accept, options?.multiple ?? true)
++
++  const paths = await new Promise<File[]>(resolve => {
++    pendingPick?.()
++
++    pendingPick = () => {
++      pendingPick = null
++      resolve([...input.files ?? []])
++    }
++
++    input.click()
++  })
++
++  return paths.map(file => registerWebFile(file))
++}
++
++async function webSaveImageBuffer(
++  data: ArrayBuffer | Uint8Array,
++  ext: string,
++  name?: string
++): Promise<string> {
++  const normalizedExt = ext.startsWith('.') ? ext : `.${ext}`
++  // slice()/ctor land on Uint8Array<ArrayBuffer>, the only BlobPart-compatible
++  // view under TS 5.7's ArrayBufferLike split.
++  const bytes = data instanceof Uint8Array ? data.slice() : new Uint8Array(data)
++
++  return registerWebBlob(new Blob([bytes]), name || `attachment${normalizedExt}`)
++}
++
+ async function webReadClipboard(): Promise<string> {
+   if (!navigator.clipboard) {
+     warnOnce('readClipboard')
+@@ -336,12 +435,12 @@ export function createWebBridge(): Window['hermesDesktop'] {
+     },
+     requestMicrophoneAccess: unavailable('requestMicrophoneAccess'),
+     readFileText: unavailable('readFileText'),
+-    selectPaths: unavailable('selectPaths'),
++    selectPaths: webSelectPaths,
+     saveImageFromUrl: unavailable('saveImageFromUrl'),
+-    saveImageBuffer: unavailable('saveImageBuffer'),
++    saveImageBuffer: webSaveImageBuffer,
+     saveClipboardImage: unavailable('saveClipboardImage'),
+-    // Sync member: File objects picked in a browser carry no real path.
+-    getPathForFile: () => '',
++    // Browser Files carry no real path; the registry mints a virtual one.
++    getPathForFile: file => registerWebFile(file),
+     normalizePreviewTarget: unavailable('normalizePreviewTarget'),
+     watchPreviewFile: unavailable('watchPreviewFile'),
+     stopPreviewFileWatch: unavailable('stopPreviewFileWatch'),
+diff --git a/apps/desktop/src/lib/bridge/web-file-registry.ts b/apps/desktop/src/lib/bridge/web-file-registry.ts
+new file mode 100644
+index 0000000000..5623d14b55
+--- /dev/null
++++ b/apps/desktop/src/lib/bridge/web-file-registry.ts
+@@ -0,0 +1,85 @@
++// Files picked or dropped inside the browser tab have no real filesystem
++// path, but the renderer's whole attach pipeline (chips, previews, submit)
++// is path-keyed. This registry bridges the two worlds: every browser File or
++// raw blob gets a stable virtual path (`/__webfs__/<id>/<name>`), and bridge
++// reads resolve those paths back to bytes as data URLs.
++//
++// Pure module — no imports, no side effects at load — so Electron bundles it
++// harmlessly (the maps simply stay empty) alongside its real fs bridge.
++
++export const WEB_FS_ROOT = '/__webfs__'
++
++const blobsByPath = new Map<string, Blob>()
++const pathByFile = new WeakMap<File, string>()
++
++let nextEntryId = 0
++
++function sanitizeEntryName(name: string): string {
++  const cleaned = name
++    .replace(/[/\\]+/g, '_')
++    // eslint-disable-next-line no-control-regex -- stripping control bytes mirrors the backend's _sanitize_attachment_name
++    .replace(/[\x00-\x1f]+/g, '_')
++    .trim()
++    .replace(/^\.+/, '')
++
++  return cleaned || 'attachment'
++}
++
++export function isWebVirtualPath(path: null | string | undefined): boolean {
++  return typeof path === 'string' && path.startsWith(`${WEB_FS_ROOT}/`)
++}
++
++export function registerWebBlob(blob: Blob, name?: string): string {
++  const entryId = ++nextEntryId
++  const finalName = sanitizeEntryName(name || (blob instanceof File ? blob.name : '') || 'attachment')
++  const path = `${WEB_FS_ROOT}/${entryId}/${finalName}`
++
++  blobsByPath.set(path, blob)
++
++  return path
++}
++
++/** Memoized per File object, so re-reading the same drop yields one path. */
++export function registerWebFile(file: File): string {
++  const existing = pathByFile.get(file)
++
++  if (existing && blobsByPath.has(existing)) {
++    return existing
++  }
++
++  const path = registerWebBlob(file, file.name)
++  pathByFile.set(file, path)
++
++  return path
++}
++
++/**
++ * Read a registered virtual path as a data URL. Returns null for non-virtual
++ * paths (callers fall through to their real-fs path) and for virtual paths
++ * whose entry is gone (registry reset between picks).
++ */
++export function readWebFileDataUrl(path: string): Promise<null | string> {
++  if (!isWebVirtualPath(path)) {
++    return Promise.resolve(null)
++  }
++
++  const blob = blobsByPath.get(path)
++
++  if (!blob) {
++    return Promise.resolve(null)
++  }
++
++  return new Promise(resolve => {
++    const reader = new FileReader()
++
++    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : null)
++    reader.onerror = () => resolve(null)
++    reader.readAsDataURL(blob)
++  })
++}
++
++/** Test seam: drop every entry so ids never collide across cases. */
++export function resetWebFileRegistry(): void {
++  blobsByPath.clear()
++  nextEntryId = 0
++}
